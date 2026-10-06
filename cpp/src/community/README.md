@@ -76,4 +76,61 @@ cugraph::flatten_dendrogram(handle, graph_view, dendrogram, clustering.data());
 
 ## Leiden
 
+`cugraph::leiden` clusters an undirected graph by maximizing the generalized modularity
+Q(gamma) = sum_c [L_c / 2m - gamma (K_c / 2m)^2] with the Leiden algorithm:
+
+ * V.A. Traag, L. Waltman, N.J. van Eck: From Louvain to Leiden: guaranteeing well-connected communities, Scientific Reports 9, 5233 (2019), https://doi.org/10.1038/s41598-019-41695-z
+
+The implementation is the native Leiden of rapids-singlecell (`rapids_singlecell.tl.leiden(flavor="rapids")`). For a graph
+built with `renumber = false` from the same CSR and the same 32-bit seed, both give bitwise identical results.
+
+ * **Iterations.** Each Leiden iteration (default 2, igraph semantics; -1 iterates until the partition is stable) runs, at
+   every level of the hierarchy, a synchronous local-moving phase in hashed sub-rounds, a refinement that splits every
+   community into well-connected sub-communities along a spanning forest of its best edges, and an aggregation by the
+   refined partition. Every iteration but the last ends with a V-cycle, and every iteration ends with a
+   connected-components split.
+ * **Guarantees.** Every returned community is connected. The returned modularity is the exact (fp64) modularity of the
+   returned clustering. Labels are ordered by decreasing community size.
+ * **Determinism.** Every decision is made in exact 64-bit fixed point (weights are quantized once), with total-order tie
+   breaks and counter-based hashes of (seed, iteration, level, phase, sweep, vertex) instead of a random number
+   generator. Identical inputs, parameters and seed give bitwise identical results, independently of thread scheduling,
+   the GPU, the vertex / edge id types, the weight type (for equal values) and the number of GPUs.
+ * **Edge semantics.** The graph must be symmetric (the data is checked). Weights must be finite and non-negative.
+   Self-loops and zero-weight edges are ignored; parallel edges are summed (fp64, in ascending order of their weights).
+ * **Memory.** One workspace allocation per call (about 3.5x the CSR, 2.9x with `low_memory`); nothing is allocated
+   inside the iterations.
+ * **Multi-GPU.** The current implementation all-gathers the edge list to every GPU and runs the single-GPU algorithm with
+   the seed of rank 0 on every rank, so the result equals the single-GPU result on the same (internal) vertex ids for any
+   number of GPUs. The graph must fit on one GPU.
+
+Code layout:
+
+ * `leiden_impl.cuh`: `cugraph::leiden` (single-GPU: the graph view's CSR is passed to the core as is; multi-GPU: the
+   all-gathered edge list); `leiden_{sg,mg}_v*_e*.cu` instantiate it.
+ * `detail/leiden/`: the core, compiled once into `libcugraph_common` and shared by the single-GPU and multi-GPU
+   libraries. `leiden_csr.hpp` declares `detail::leiden_csr` (raw CSR) and `detail::leiden_coo` (edge list in any
+   order); `leiden_csr_impl.cuh` holds the input check, the canonicalization of parallel edges (`canonicalize.cuh`), the
+   workspace and the level-0 quantization; the type-independent engine (`numerics.cuh` fixed point and hashes,
+   `arena.cuh` workspace layout, `kernels_{ingest,move,refine,aggregate,final}.cuh`, `driver.cuh`) is compiled once in
+   `driver_common.cu` (interface: `driver.hpp`). The file names match the rapids-singlecell sources so that changes can
+   be diffed and merged in both directions.
+
+The unit tests are the best place to look for examples: [SG](../../tests/community/leiden_test.cpp),
+[MG](../../tests/community/mg_leiden_test.cpp).
+
+```cpp
+#include <cugraph/algorithms.hpp>
+...
+raft::random::RngState rng_state{seed};
+rmm::device_uvector<vertex_t> clustering_v(graph_view.local_vertex_partition_range_size(), handle.get_stream());
+cugraph::leiden_params_t params{};  // resolution 1, 2 iterations
+auto result = cugraph::leiden(handle,
+                              rng_state,
+                              graph_view,
+                              edge_weight_view,  // std::nullopt: unit weights
+                              raft::device_span<vertex_t>{clustering_v.data(), clustering_v.size()},
+                              params);
+// result.num_clusters, result.modularity, result.num_iterations, result.num_levels
+```
+
 ## ECG
