@@ -71,12 +71,10 @@ def leiden(
     random_state: int, optional(default=None)
         Seed of the hashes that randomize the order of the local moves. Only
         its low 32 bits are used. The partition depends on the seed and on
-        the internal vertex numbering of `G`. Defaults to a hash of process
-        id, time, and hostname. For a graph built with
-        ``G.from_cudf_edgelist(..., renumber=False)`` from a symmetric
-        sparse matrix (such as a k-NN graph), the result is bitwise
-        identical to ``rapids_singlecell.tl.leiden(flavor="rapids")`` on
-        that matrix with the same seed.
+        the internal vertex numbering of `G` (with
+        ``G.from_cudf_edgelist(..., renumber=False)`` the input vertex ids
+        are used). Defaults to a hash of process id, time, and hostname. The
+        same graph, parameters and seed give the bitwise identical result.
 
     theta: float, optional (default=None)
         Deprecated and ignored: it was never used by the implementation (see

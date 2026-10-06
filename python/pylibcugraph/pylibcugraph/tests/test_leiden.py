@@ -39,9 +39,9 @@ _expected = {
     "unweighted": ([0, 0, 0, 0, 1, 1], 0.125),
 }
 
-# karate (file vertex ids), resolution 1, n_iterations 2, random_state 0: the
-# result of rapids_singlecell.tl.leiden(flavor="rapids"), which runs the same
-# engine
+# karate (file vertex ids), resolution 1, n_iterations 2, random_state 0. The
+# algorithm is deterministic (exact integer decisions, fixed-order modularity
+# sum), so the call reproduces these values exactly on every GPU
 # fmt: off
 _karate_partition = [1, 1, 1, 1, 3, 3, 3, 1, 0, 0, 3, 1, 1, 1, 0, 0, 3, 1, 0, 1,
                      0, 1, 0, 2, 2, 2, 0, 2, 2, 0, 0, 2, 0, 0]

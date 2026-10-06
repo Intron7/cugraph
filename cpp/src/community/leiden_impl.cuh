@@ -42,9 +42,8 @@ namespace cugraph {
 namespace detail {
 
 // 32-bit seed of one call: the low 32 bits of rng_state.seed, XOR a hash of the base subsequence
-// (zero for a fresh RngState, so RngState{s} gives seed uint32_t(s), the seed rapids-singlecell
-// passes to the same engine). Advances the state by one subsequence, so successive calls with the
-// same state use different seeds.
+// (zero for a fresh RngState, so RngState{s} gives the seed uint32_t(s)). Advances the state by one
+// subsequence, so successive calls with the same state use different seeds.
 inline uint32_t leiden_seed(raft::random::RngState& rng_state)
 {
   uint32_t h = 0;
@@ -141,10 +140,12 @@ leiden_result_t leiden_mg(
         std::optional<raft::device_span<vertex_t const>>{std::nullopt});
     srcs = device_allgatherv(
       handle, comm, raft::device_span<vertex_t const>(local_srcs.data(), local_srcs.size()));
-    local_srcs.release();
+    local_srcs.resize(0, stream);
+    local_srcs.shrink_to_fit(stream);
     dsts = device_allgatherv(
       handle, comm, raft::device_span<vertex_t const>(local_dsts.data(), local_dsts.size()));
-    local_dsts.release();
+    local_dsts.resize(0, stream);
+    local_dsts.shrink_to_fit(stream);
     if (local_weights) {
       weights = device_allgatherv(
         handle,

@@ -125,7 +125,7 @@ def leiden(ResourceHandle resource_handle,
 
     do_expensive_check : bool, optional (default=False)
         If True, performs more extensive tests on the inputs to ensure
-        validitity, at the expense of increased run time. The checks of the
+        validity, at the expense of increased run time. The checks of the
         graph data (CSR structure, weights, symmetry) always run.
 
     n_iterations : int, optional (default=2)

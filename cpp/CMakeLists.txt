@@ -237,12 +237,9 @@ set(CUGRAPH_COMMON_SOURCES
 
 # The Leiden engine writes every rounded operation that feeds a decision with an explicit `_rn`
 # intrinsic; disabling FMA contraction additionally pins the remaining fp64 expressions, so the
-# results do not depend on the compiler's contraction choices (bitwise reproducibility).
+# results do not depend on the compiler's contraction choices (bitwise reproducibility). The
+# cugraph::leiden front ends (leiden_{sg,mg}_v*_e*.cu) make no floating-point decisions.
 set_source_files_properties(${CUGRAPH_COMMON_COMMUNITY_SOURCES}
-                            src/community/leiden_sg_v64_e64.cu
-                            src/community/leiden_sg_v32_e32.cu
-                            src/community/leiden_mg_v64_e64.cu
-                            src/community/leiden_mg_v32_e32.cu
                             PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>")
 
 set(CUGRAPH_MTMG_SOURCES

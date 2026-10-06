@@ -4,16 +4,15 @@
  */
 #pragma once
 
-// I1c: canonicalize (spec §4.1, §7). Rare path, run only when the input check I1 flags a row
-// that is not strictly increasing by column (parallel edges, or unsorted rows).
+// I1c: canonicalize. Rare path, run only when the input check I1 flags a row that is not strictly
+// increasing by column (parallel edges, or unsorted rows).
 //
 // Every row is sorted by column and every run of parallel edges (u, v) is replaced by one entry
 // whose weight is the fp64 sum of the run. The run is summed sequentially in ascending order of
 // the weight values, so the canonical CSR is a function of the multiset of (row, column, weight)
-// entries only: it does not depend on the order in which the entries are stored. (rapids-
-// singlecell sums the run in stored order; for a canonical input both are the identity.) This is
-// what makes the multi-GPU path, whose stored order depends on the edge partitioning, bitwise
-// identical to the single-GPU path for multigraphs too.
+// entries only: it does not depend on the order in which the entries are stored. This is what
+// makes the multi-GPU path, whose stored order depends on the edge partitioning, bitwise identical
+// to the single-GPU path for multigraphs too.
 //
 // Rows are processed in chunks of whole rows with at most kCanonChunk entries (or one longer row),
 // so every CUB call has < 2^31 items. Within a chunk, a stable LSD radix sort of the weight keys

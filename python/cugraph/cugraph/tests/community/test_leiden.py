@@ -67,11 +67,12 @@ _test_data = {
     },
 }
 
-# Results for the datasets with their file vertex ids (renumber=False),
-# resolution 1, n_iterations 2 and random_state 0. They were generated with
-# rapids_singlecell.tl.leiden(flavor="rapids"), which runs the same engine and
-# gives the bitwise identical result, and agree with an independent CPU
-# implementation of the algorithm. The modularity is given as float.hex().
+# cugraph.leiden(G, resolution=1.0, random_state=0) with the default
+# n_iterations=2 on the datasets with their file vertex ids (renumber=False;
+# vertex ids enter the hashes). The algorithm makes every decision in exact
+# integer arithmetic and sums the modularity in a fixed order, so these values
+# are exact on every GPU: rerunning the call reproduces them, and a mismatch
+# means that the algorithm changed. The modularity is given as float.hex().
 _reference_results = {
     "karate": {
         "num_clusters": 4,

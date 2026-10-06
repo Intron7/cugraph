@@ -84,9 +84,11 @@ def test_mg_leiden_equals_sg(dask_client, dataset, params):
     # Multi-GPU Leiden is bitwise identical to single-GPU Leiden on a graph
     # with the same internal vertex numbering, for any number of workers.
     # A distributed graph is always renumbered internally. The result rows
-    # come in internal-id order (the workers in rank order, the local
-    # vertices of every worker in internal-id order, since renumber=False
-    # skips the unrenumbering), which gives the internal numbering.
+    # come in internal-id order, which gives the internal numbering: the
+    # result partitions are in rank order (dcg.leiden iterates over the
+    # workers of dg._plc_graph, which persist_dask_df_equal_parts_per_worker
+    # sorted by rank), and the local vertices of every worker are in
+    # internal-id order (renumber=False skips the unrenumbering).
     dg = get_mg_graph(dataset, directed=False, renumber=False)
     mg_parts, mg_mod = dcg.leiden(dg, **params)
     mg_parts = mg_parts.compute().reset_index(drop=True)
