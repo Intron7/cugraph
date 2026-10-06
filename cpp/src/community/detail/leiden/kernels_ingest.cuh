@@ -4,22 +4,23 @@
  */
 #pragma once
 
-// Ingest (spec §4.1-§4.3, §7 I1-I4). Templated on the input arrays <IP, IX, WI> (offsets,
-// indices, weights of the input CSR); included by the typed raw-CSR entry point only
-// (community/detail/leiden/leiden_csr_impl.cuh). I1c (canonicalize) is in canonicalize.cuh.
+// Ingest. Templated on the input arrays <IP, IX, WI> (offsets, indices, weights of the input
+// CSR); included by the typed raw-CSR entry point only (community/detail/leiden/
+// leiden_csr_impl.cuh). I1c (canonicalize) is in canonicalize.cuh.
 //
 //   I1   ingest_check      error flags, row-order check (parallel edges), nnz_c (counted
 //                          entries), wmax and the order-free symmetry fingerprints of the
 //                          counted entries; one sync, before the workspace is sized
 //   I2   quantize_degrees  int64 offsets (widened), int32 indices (narrowed from int64
 //                          input), W0q when fp32 on the fly is not possible, k_hat, 2m_hat
-//                          (exact int64), degree classes and the maximum degree of level 0
-//   I4   replicate_union   replica union graph (R > 1, §4.2.1)
+//                          (exact int64) and the degree classes of level 0
+//   I4   replicate_union   replica union graph (R > 1: small graphs run R disjoint copies in
+//                          the first iteration and keep the best)
 //
-// Weight semantics (golden reference): for a weighted graph the value of a stored entry is the
-// edge weight. Without weights every entry has the value 1.0f and the weighted path runs
-// unchanged, so an unweighted graph is bitwise equal to one with all weights 1. An entry (v, u)
-// is counted iff u != v and its value is > 0: self-loops and zero-weight edges are ignored.
+// Weight semantics: for a weighted graph the value of a stored entry is the edge weight. Without
+// weights every entry has the value 1.0f and the weighted path runs unchanged, so an unweighted
+// graph is bitwise equal to one with all weights 1. An entry (v, u) is counted iff u != v and its
+// value is > 0: self-loops and zero-weight edges are ignored.
 
 #include "community/detail/leiden/arena.cuh"
 #include "community/detail/leiden/driver.hpp"
@@ -210,7 +211,8 @@ IngestInfo run_ingest_check(const IP* indptr,
   clear_control(ctl, s);
   if (n > 0) {
     ingest_scan_kernel<IP, IX, WI>
-      <<<grid_rows(n), kBlock, 0, s>>>(indptr, indices, val, n, nnz, ctl);
+      <<<grid_occ(ingest_scan_kernel<IP, IX, WI>, n, kWarpsPerBlock), kBlock, 0, s>>>(
+        indptr, indices, val, n, nnz, ctl);
     RAFT_CHECK_CUDA(s);
   }
   const Control h = read_control(ctl, s, pinned);
@@ -270,17 +272,15 @@ __global__ void quantize_degrees_kernel(const IP* __restrict__ indptr,
                                         i64* __restrict__ indptr64,
                                         int* __restrict__ idx32,
                                         i64* __restrict__ khat,
-                                        unsigned char* __restrict__ vclass,
                                         Control* ctl)
 {
   __shared__ i64 s_two_m[kWarpsPerBlock];
-  __shared__ i64 s_max[kWarpsPerBlock];
   __shared__ i64 s_cls[kWarpsPerBlock][kNumClasses];
   const int lane = threadIdx.x & (kWarp - 1), wib = threadIdx.x / kWarp;
-  const i64 warp0  = static_cast<i64>(blockIdx.x) * kWarpsPerBlock + wib;
-  const i64 nwarps = static_cast<i64>(gridDim.x) * kWarpsPerBlock;
-  i64 two_m = 0, maxdeg = 0;
-  i64 cls[kNumClasses] = {0, 0, 0, 0};
+  const i64 warp0      = static_cast<i64>(blockIdx.x) * kWarpsPerBlock + wib;
+  const i64 nwarps     = static_cast<i64>(gridDim.x) * kWarpsPerBlock;
+  i64 two_m            = 0;
+  i64 cls[kNumClasses] = {};
   for (i64 v = warp0; v < n; v += nwarps) {
     const i64 b = static_cast<i64>(indptr[v]);
     const i64 e = static_cast<i64>(indptr[v + 1]);
@@ -295,30 +295,25 @@ __global__ void quantize_degrees_kernel(const IP* __restrict__ indptr,
       const int c = degree_class(e - b, th);
       indptr64[v] = b;
       if (v == n - 1) indptr64[n] = e;
-      khat[v]   = k;
-      vclass[v] = static_cast<unsigned char>(c);
+      khat[v] = k;
       two_m += k;
-      maxdeg = e - b > maxdeg ? e - b : maxdeg;
       ++cls[c];
     }
   }
   if (lane == 0) {
     s_two_m[wib] = two_m;
-    s_max[wib]   = maxdeg;
     for (int c = 0; c < kNumClasses; ++c)
       s_cls[wib][c] = cls[c];
   }
   __syncthreads();
   if (threadIdx.x == 0) {
-    i64 t = 0, mx = 0, cc[kNumClasses] = {0, 0, 0, 0};
+    i64 t = 0, cc[kNumClasses] = {};
     for (int i = 0; i < kWarpsPerBlock; ++i) {
       t += s_two_m[i];
-      mx = s_max[i] > mx ? s_max[i] : mx;
       for (int c = 0; c < kNumClasses; ++c)
         cc[c] += s_cls[i][c];
     }
     atomicAdd(reinterpret_cast<u64*>(&ctl->two_m_hat), static_cast<u64>(t));
-    atomicMax(reinterpret_cast<u64*>(&ctl->max_degree), static_cast<u64>(mx));
     for (int c = 0; c < kNumClasses; ++c)
       if (cc[c]) atomicAdd(reinterpret_cast<u64*>(&ctl->class_count[c]), static_cast<u64>(cc[c]));
   }
@@ -335,15 +330,13 @@ __global__ static void replicate_union_kernel(const i64* __restrict__ indptr0,
                                               const float* __restrict__ wf0,
                                               const i64* __restrict__ wq0,
                                               const i64* __restrict__ khat0,
-                                              const unsigned char* __restrict__ vclass0,
                                               i64 n,
                                               int R,
                                               i64* __restrict__ indptr_u,
                                               int* __restrict__ idx_u,
                                               float* __restrict__ wf_u,
                                               i64* __restrict__ wq_u,
-                                              i64* __restrict__ khat_u,
-                                              unsigned char* __restrict__ vclass_u)
+                                              i64* __restrict__ khat_u)
 {
   const int lane   = threadIdx.x & (kWarp - 1);
   const i64 warp0  = static_cast<i64>(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarp;
@@ -356,8 +349,7 @@ __global__ static void replicate_union_kernel(const i64* __restrict__ indptr0,
     if (lane == 0) {
       indptr_u[x] = shift + b;
       if (x == rows - 1) indptr_u[rows] = static_cast<i64>(R) * nnz0;
-      khat_u[x]   = khat0[v];
-      vclass_u[x] = vclass0[v];
+      khat_u[x] = khat0[v];
     }
     for (i64 j = b + lane; j < e; j += kWarp) {
       idx_u[shift + j] = static_cast<int>(r * n) + idx0[j];
@@ -377,9 +369,7 @@ inline void check_gamma(double gamma)
                   "leiden: resolution must be finite and in [0, 2^20].");
 }
 
-// The input must have passed I1 (`info`) without any flag the caller rejects.
-// Returns !ok with the required layout when the carved one lacks the
-// representation this input needs at this resolution.
+// I2 (+ I4) for one scale; the input passed I1 (`info`) without any flag the caller rejects.
 template <typename IP, typename IX, typename WI>
 QuantizeResult run_quantize(const IP* indptr,
                             const IX* indices,
@@ -411,18 +401,9 @@ QuantizeResult run_quantize(const IP* indptr,
   res.s      = scale_for_gamma(scale_s0(info.n_counted, info.wmax), gamma);
   res.unit_q = weighted ? 0 : unit_weight(res.s);
   res.wkind  = level0_kind(info.flags, weighted, std::is_same_v<WI, float>, res.s);
-  const bool ok =
-    (res.wkind != WKind::I64 || L.l0.wq != nullptr) && (idx_is_32 || L.l0.indices != nullptr);
-  if (!ok) {
-    LayoutParams q = L.p;
-    q.idx64_input  = q.idx64_input || !idx_is_32;
-    if (res.wkind == WKind::I64) q.wkind = WKind::I64;
-    res.ok                   = false;
-    res.required_wkind       = q.wkind;
-    res.required_idx64_input = q.idx64_input;
-    res.required_bytes       = workspace_bytes(q);
-    return res;
-  }
+  CUGRAPH_EXPECTS(
+    (res.wkind != WKind::I64 || L.l0.wq != nullptr) && (idx_is_32 || L.l0.indices != nullptr),
+    "leiden: internal error: the workspace layout lacks a level-0 array.");
   Control* ctl = L.ctl;
   clear_control(ctl, stream);
   int* idx32  = idx_is_32 ? nullptr : L.l0.indices;
@@ -433,10 +414,11 @@ QuantizeResult run_quantize(const IP* indptr,
 
   // I2
   if (n > 0) {
-    const unsigned g = grid_rows(n);
-    auto launch      = [&](auto src) {
-      quantize_degrees_kernel<IP, IX, decltype(src)><<<g, kBlock, 0, stream>>>(
-        indptr, indices, src, n, th, L.l0.indptr, idx32, L.l0.khat, L.l0.vclass, ctl);
+    auto launch = [&](auto src) {
+      using Src        = decltype(src);
+      const unsigned g = grid_occ(quantize_degrees_kernel<IP, IX, Src>, n, kWarpsPerBlock);
+      quantize_degrees_kernel<IP, IX, Src>
+        <<<g, kBlock, 0, stream>>>(indptr, indices, src, n, th, L.l0.indptr, idx32, L.l0.khat, ctl);
       RAFT_CHECK_CUDA(stream);
     };
     if (res.wkind == WKind::UNIT) {
@@ -450,7 +432,7 @@ QuantizeResult run_quantize(const IP* indptr,
     RAFT_CUDA_TRY(cudaMemsetAsync(L.l0.indptr, 0, sizeof(i64), stream));
   }
 
-  // I4: replica union (iteration 1 only; rebuilt whenever s changes)
+  // I4: replica union (iteration 1 only)
   if (L.p.replicas > 1 && n > 0) {
     replicate_union_kernel<<<grid_rows(L.p.n_union()), kBlock, 0, stream>>>(
       L.l0.indptr,
@@ -458,21 +440,18 @@ QuantizeResult run_quantize(const IP* indptr,
       res.wf32,
       res.wq,
       L.l0.khat,
-      L.l0.vclass,
       n,
       L.p.replicas,
       L.uni.indptr,
       L.uni.indices,
       res.wkind == WKind::F32 ? L.uni.wf32 : nullptr,
       res.wkind == WKind::I64 ? L.uni.wq : nullptr,
-      L.uni.khat,
-      L.uni.vclass);
+      L.uni.khat);
     RAFT_CHECK_CUDA(stream);
   }
 
   const Control h = read_control(ctl, stream, L.pinned);  // sync S2
   res.two_m_hat   = h.two_m_hat;
-  res.max_degree  = h.max_degree;
   for (int c = 0; c < kNumClasses; ++c)
     res.class_count[c] = h.class_count[c];
   return res;

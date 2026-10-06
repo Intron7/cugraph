@@ -363,7 +363,10 @@ class Tests_Leiden : public ::testing::TestWithParam<std::tuple<Leiden_Usecase, 
     ASSERT_GE(result.num_levels, size_t{1});
 
     // Determinism: the same seed gives the identical clustering and the bitwise identical
-    // modularity, also with the low-memory layout (two-pass contraction).
+    // modularity, also with every layout of the engine: each kernel launch mode (0: plain stream
+    // launches, 1: CUDA graph replays, the path of CUDA < 12.4; the default 2 runs the
+    // local-moving sweeps in a conditional WHILE node where supported), and a level arena too small
+    // for the first level (the engine reruns on a larger one).
     {
       auto [labels2, result2] = run_leiden<vertex_t, edge_t, weight_t>(
         handle, graph_view, edge_weight_view, params, uint64_t{42});
@@ -371,12 +374,34 @@ class Tests_Leiden : public ::testing::TestWithParam<std::tuple<Leiden_Usecase, 
       ASSERT_EQ(bits_of(result.modularity), bits_of(result2.modularity));
       ASSERT_EQ(result.num_levels, result2.num_levels);
 
-      auto low_memory_params       = params;
-      low_memory_params.low_memory = true;
-      auto [labels3, result3]      = run_leiden<vertex_t, edge_t, weight_t>(
-        handle, graph_view, edge_weight_view, low_memory_params, uint64_t{42});
-      ASSERT_EQ(labels, labels3) << "low_memory changed the clustering";
-      ASSERT_EQ(bits_of(result.modularity), bits_of(result3.modularity));
+      // A fresh RngState{42} gives cugraph::leiden the 32-bit seed 42.
+      auto partition = graph_view.local_edge_partition_view();
+      std::optional<raft::device_span<weight_t const>> weights{std::nullopt};
+      if (edge_weight_view) {
+        weights = raft::device_span<weight_t const>(edge_weight_view->value_firsts()[0],
+                                                    partition.indices().size());
+      }
+      for (auto const& options : {cugraph::detail::leiden_layout_options_t{0, 1.9},
+                                  cugraph::detail::leiden_layout_options_t{1, 1.9},
+                                  cugraph::detail::leiden_layout_options_t{2, 0.01}}) {
+        SCOPED_TRACE("graph_mode " + std::to_string(options.graph_mode) + ", arena_factor " +
+                     std::to_string(options.arena_factor));
+        rmm::device_uvector<vertex_t> d_labels3(graph_view.number_of_vertices(),
+                                                handle.get_stream());
+        auto const result3 = cugraph::detail::leiden_csr<vertex_t, edge_t, weight_t>(
+          handle,
+          uint32_t{42},
+          raft::device_span<edge_t const>(partition.offsets().data(), partition.offsets().size()),
+          raft::device_span<vertex_t const>(partition.indices().data(), partition.indices().size()),
+          weights,
+          raft::device_span<vertex_t>(d_labels3.data(), d_labels3.size()),
+          params,
+          options);
+        ASSERT_EQ(labels, cugraph::test::to_host(handle, d_labels3))
+          << "the engine layout changed the clustering";
+        ASSERT_EQ(bits_of(result.modularity), bits_of(result3.modularity));
+        ASSERT_EQ(result.num_levels, result3.num_levels);
+      }
     }
 
     // Every community is connected, and the returned Q is the modularity of the returned

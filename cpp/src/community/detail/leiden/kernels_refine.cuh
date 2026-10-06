@@ -4,97 +4,53 @@
  */
 #pragma once
 
-// PLEIDEN_R refinement (spec §4.8, §7 R1-R9): a spanning forest inside each
-// move community S with a deterministic heaviest-modularity-edge choice, then
-// the longest valid prefix of every tree (in ord order) is committed.
-//
-// R1 refine_ext_u: ext_v = w(v, S_v minus v) and the R-test
-//    U_v = ext_v >= pen_v(K_S - k_v).
-// R2 refine_choose: hn_v = argmax of (key(v, u), -u) over the U neighbours in
-//    S with key >= 0, else v; root_v = (hn_v == v ? v : -1), initialised
-//    here by v's own thread (red team RA6).
-// R3 forest_chase1: a separate launch; chases towards lower f and writes only
-//    root_v (its own) and root_now = now, never -1.
-// R4 forest_flip: flipped_v = (root_v == -1), the post-R3 snapshot;
-//    forest_chase2: flipped vertices chase along ord to a rooted vertex
-//    (reading the snapshot, so no read races a root write) and count the
-//    tree sizes (R5).
-// R5 scan + tree_scatter: members grouped by root (any order inside a tree);
-//    r_v = v; trees listed by commit class.
-// R7 refine_inner: inner_v = w(v, members of v's tree preceding it in ord).
-// R8 tree_commit: the longest valid prefix, per class: thread per tree (<= 8
-//    members: sorting network in registers; almost every tree of a kNN
-//    level), warp per tree (<= 32: bitonic sort, warp scans, ballot of the
-//    first failure), block per tree (<= 1024: BlockRadixSort + BlockScan),
-//    larger trees: DeviceSegmentedSort over just those trees, then a chunked
-//    block scan per tree.
-// R9 host_flags + scan + cmap: coarse id = rank of the host id among hosts.
-//
-// The row kernels (R1, R2, R7) use a group prefetch: a warp takes 32
-// consecutive rows and loads their metadata with one coalesced load per lane.
-//
-// Every decision input is an exact int64 (fixed point, §4.3); orders are
-// bijective hashes (§4.4), so there are no ties and the result depends neither
-// on thread interleaving, launch geometry nor the commit class of a tree. All
-// arrays are written before they are read within one call (§6.5); counters
-// live in the Control block and are zeroed by the kernel that starts their
-// accumulation. The coarse node weights k_hat_{l+1} are summed from the members
-// by AGGREGATE (red team RA2); R8's k_hat' (kprime) only serves the debug
-// assertion and the tests.
+// PLEIDEN_R refinement: a spanning forest inside each move community S (every
+// vertex picks its heaviest-modularity edge), then the longest valid prefix of
+// every tree in ord order is committed. R1 ext_v and the R-test U_v; R2 the
+// best U neighbour hn_v; R3 / R4 chases to the roots; R5 members by root; R7
+// inner_v; R8 the prefix; R9 coarse ids. Decisions read exact int64 values and
+// orders are bijective hashes (no ties), so neither interleaving, launch
+// geometry nor the commit class changes a result.
 
 #include "community/detail/leiden/arena.cuh"
-#include "community/detail/leiden/kernels_final.cuh"
+#include "community/detail/leiden/graph.cuh"
+#include "community/detail/leiden/kernels_scan.cuh"
 #include "community/detail/leiden/numerics.cuh"
 
 #include <cugraph/utilities/error.hpp>
 
 #include <raft/util/cuda_rt_essentials.hpp>
 
-#include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
-#include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_sort.cuh>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 
 #include <cuda_runtime.h>
 
-#include <climits>
-#include <cmath>
-#include <cstddef>
-#include <cstdint>
+#include <vector>
 
 namespace cugraph::detail::leiden_engine {
 
-// Error bit for a violated forest invariant (debug check of §4.8 invariants
-// 1-2; never expected). Shares the Control flags word with the ingest bits.
 constexpr u32 kFlagForestInvariant = 1u << 24;
 
-// Tree commit classes (R8): runtime thresholds, so tests can force each path.
 struct TreeClasses {
-  int thread = 8;     // <= 8 members: thread per tree (sorting network)
-  int warp   = 32;    // <= 32 members: warp per tree (bitonic sort)
-  int block  = 1024;  // <= 1024 members: block per tree (BlockRadixSort)
+  int thread = 8;   // <= 8 members: thread per tree (sorting network)
+  int warp   = 32;  // <= 32 members: warp per tree (bitonic sort)
 };  // larger trees: segmented sort + chunked block scan
-// Commit-class lists (R5): thread class from the front of tree_list, warp
-// class from its back; block class from the back of large_list, larger trees
-// from its front. Counts in Control::tree_list_count[class].
-enum : int { kTreeThread = 0, kTreeWarp = 1, kTreeBlock = 2, kTreeLarge = 3 };
+// tree_list: thread class from the front, warp class from the back.
+enum : int { kTreeThread = 0, kTreeWarp = 1, kTreeLarge = 2 };
 constexpr int kTinyTree = 8;  // register arrays of the thread class
 
-constexpr int kCommitBlock = 256;                     // threads of the block commit kernels
-constexpr int kCommitItems = 4;                       // items per thread: 1024 members per block
-constexpr int kOrdBits     = 34;                      // ord(v) <= 2^33
-constexpr u64 kOrdPad      = (1ull << kOrdBits) - 1;  // sorts after every ord
+constexpr int kCommitBlock = 256;               // threads of the large commit kernel
+constexpr u64 kOrdPad      = (1ull << 34) - 1;  // sorts after every ord (<= 2^33)
 
-// ord(v) of §4.4: flipped ? 2^33 - f(v) : f(v); unique within a level.
 __device__ __forceinline__ i64 refine_ord(u64 ctx_order, int v, bool flipped)
 {
   return order_key(order_f(ctx_order, v), flipped);
 }
 
-// Slot of the next item of a warp-aggregated append (one atomic per warp);
-// -1 for lanes with pred false. Every lane of the warp must call it.
+// Slot of a warp-aggregated append (-1 if !pred); every lane must call it.
 __device__ __forceinline__ int refine_list_append(bool pred, int* counter)
 {
   const unsigned m = __ballot_sync(kFullMask, pred);
@@ -107,18 +63,14 @@ __device__ __forceinline__ int refine_list_append(bool pred, int* counter)
   return pred ? base + __popc(m & ((1u << lane) - 1u)) : -1;
 }
 
-// ---------------------------------------------------------------------------
-// R1 / R2 / R7: warp per row (sums and per-entry argmaxes; no tables)
-// ---------------------------------------------------------------------------
-//
-// Group prefetch (as D's move kernels): a warp takes 32 consecutive rows;
-// lane i loads row base + i's offsets and per-vertex state, then the warp
-// walks the rows with that state broadcast by shuffles, so no row's edge loads
-// wait on a dependent metadata load, and the per-vertex epilogue (fixed-point
-// multiplier, R-test) runs on all lanes at once.
+// Row kernels (R1, R2, R7): a warp walks up to 32 consecutive rows.
+__device__ __forceinline__ int refine_rows_per_warp(i64 n, i64 nwarps)
+{
+  const i64 r = (n + nwarps - 1) / nwarps;
+  return r < 1 ? 1 : (r > kWarp ? kWarp : static_cast<int>(r));
+}
 
-// R1: ext_v and the R-test U_v (>= as igraph leiden.c:410-413). Labels outside
-// [0, C) set kFlagBadLabel.
+// R1: ext_v and the R-test U_v (>= as igraph leiden.c).
 template <WKind K>
 __global__ void refine_ext_u_kernel(const i64* __restrict__ indptr,
                                     const int* __restrict__ indices,
@@ -127,20 +79,25 @@ __global__ void refine_ext_u_kernel(const i64* __restrict__ indptr,
                                     const int* __restrict__ S,
                                     const i64* __restrict__ KS,
                                     i64 n,
-                                    i64 C,
+                                    i64 C_host,
+                                    const i64* __restrict__ C_dev,
                                     double lam,
                                     i64* __restrict__ ext,
                                     unsigned char* __restrict__ U,
+                                    int* __restrict__ SU,
                                     Control* ctl)
 {
+  const i64 C      = C_dev ? *C_dev : C_host;
   const int lane   = threadIdx.x & (kWarp - 1);
   const i64 warp0  = static_cast<i64>(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarp;
   const i64 nwarps = static_cast<i64>(gridDim.x) * kWarpsPerBlock;
-  for (i64 base = warp0 * kWarp; base < n; base += nwarps * kWarp) {
-    const i64 v = base + lane;
+  const int rpw    = refine_rows_per_warp(n, nwarps);
+  for (i64 base = warp0 * rpw; base < n; base += nwarps * rpw) {
+    const i64 v    = base + lane;
+    const bool own = lane < rpw && v < n;
     i64 b = 0, e = 0;
     int s = -1;
-    if (v < n) {
+    if (own) {
       b = indptr[v];
       e = indptr[v + 1];
       s = S[v];
@@ -149,7 +106,7 @@ __global__ void refine_ext_u_kernel(const i64* __restrict__ indptr,
         s = -1;
       }
     }
-    const int rows = n - base < kWarp ? static_cast<int>(n - base) : kWarp;
+    const int rows = n - base < rpw ? static_cast<int>(n - base) : rpw;
     i64 mine       = 0;
     for (int q = 0; q < rows; ++q) {
       const int sq = __shfl_sync(kFullMask, s, q);
@@ -159,30 +116,30 @@ __global__ void refine_ext_u_kernel(const i64* __restrict__ indptr,
       i64 acc      = 0;
       if (sq >= 0) {  // warp-uniform
         for (i64 j = bq + lane; j < eq; j += kWarp) {
-          const int u = indices[j];
+          const int u = __ldcs(&indices[j]);
           if (u == vq) continue;
-          const i64 x = w(j);
+          const i64 x = w.cs(j);
           if (x > 0 && S[u] == sq) acc += x;
         }
       }
       acc = warp_sum(acc);
       if (lane == q) mine = acc;
     }
-    if (v < n) {
-      ext[v] = mine;
-      if (s < 0) {
-        U[v] = 0;
-      } else {
+    if (own) {
+      ext[v]    = mine;
+      bool u_ok = false;
+      if (s >= 0) {
         const i64 kv = khat[v];
-        U[v]         = mine >= pen(KS[s] - kv, make_mult(kv, lam)) ? 1 : 0;
+        u_ok         = mine >= pen(KS[s] - kv, make_mult(kv, lam));
       }
+      U[v]  = u_ok ? 1 : 0;
+      SU[v] = u_ok ? s : -1;  // R2's neighbour test in one gather
     }
   }
 }
 
-// R2: hn_v = argmax over counted (v, u) with S_u = S_v, U_u and
-// key(v, u) = w_vu - pen_v(k_u) >= 0 of (key, -u); v itself if U_v fails or
-// there is no such u. root_v is initialised here, by v's own thread.
+// R2: hn_v = argmax of (key, -u), key = w_vu - pen_v(k_u) >= 0, over counted U
+// neighbours u in S_v (SU = U_u ? S_u : -1); v if U_v fails or there is none.
 template <WKind K>
 __global__ void refine_choose_kernel(const i64* __restrict__ indptr,
                                      const int* __restrict__ indices,
@@ -190,6 +147,7 @@ __global__ void refine_choose_kernel(const i64* __restrict__ indptr,
                                      const i64* __restrict__ khat,
                                      const int* __restrict__ S,
                                      const unsigned char* __restrict__ U,
+                                     const int* __restrict__ SU,
                                      i64 n,
                                      double lam,
                                      int* __restrict__ hn,
@@ -198,18 +156,20 @@ __global__ void refine_choose_kernel(const i64* __restrict__ indptr,
   const int lane   = threadIdx.x & (kWarp - 1);
   const i64 warp0  = static_cast<i64>(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarp;
   const i64 nwarps = static_cast<i64>(gridDim.x) * kWarpsPerBlock;
-  for (i64 base = warp0 * kWarp; base < n; base += nwarps * kWarp) {
-    const i64 v = base + lane;
+  const int rpw    = refine_rows_per_warp(n, nwarps);
+  for (i64 base = warp0 * rpw; base < n; base += nwarps * rpw) {
+    const i64 v    = base + lane;
+    const bool own = lane < rpw && v < n;
     i64 b = 0, e = 0;
     int s = -1;  // -1: v fails the R-test (no edge choice)
     Mult mv{0ull, 0};
-    if (v < n && U[v]) {
+    if (own && U[v]) {
       b  = indptr[v];
       e  = indptr[v + 1];
       s  = S[v];
       mv = make_mult(khat[v], lam);
     }
-    const int rows = n - base < kWarp ? static_cast<int>(n - base) : kWarp;
+    const int rows = n - base < rpw ? static_cast<int>(n - base) : rpw;
     int mine       = -1;
     for (int q = 0; q < rows; ++q) {
       const int sq = __shfl_sync(kFullMask, s, q);
@@ -219,30 +179,30 @@ __global__ void refine_choose_kernel(const i64* __restrict__ indptr,
       const Mult mq{__shfl_sync(kFullMask, mv.M, q), __shfl_sync(kFullMask, mv.sh, q)};
       const i64 vq = base + q;
       i64 bk       = -1;       // best key (valid keys are >= 0)
-      int bu       = INT_MAX;  // its vertex
+      int bv       = INT_MAX;  // its vertex
       for (i64 j = bq + lane; j < eq; j += kWarp) {
-        const int u = indices[j];
-        if (u == vq || S[u] != sq || !U[u]) continue;
-        const i64 x = w(j);
+        const int u = __ldcs(&indices[j]);
+        if (u == vq || SU[u] != sq) continue;  // S_u == S_v, U_u
+        const i64 x = w.cs(j);
         if (x <= 0) continue;  // not counted
         const i64 key = x - pen(khat[u], mq);
-        if (key > bk || (key == bk && u < bu)) {
+        if (key > bk || (key == bk && u < bv)) {
           bk = key;
-          bu = u;
+          bv = u;
         }
       }
 #pragma unroll
       for (int o = kWarp / 2; o > 0; o >>= 1) {
         const i64 ok = __shfl_xor_sync(kFullMask, bk, o);
-        const int ou = __shfl_xor_sync(kFullMask, bu, o);
-        if (ok > bk || (ok == bk && ou < bu)) {
+        const int ou = __shfl_xor_sync(kFullMask, bv, o);
+        if (ok > bk || (ok == bk && ou < bv)) {
           bk = ok;
-          bu = ou;
+          bv = ou;
         }
       }
-      if (lane == q && bk >= 0) mine = bu;
+      if (lane == q && bk >= 0) mine = bv;
     }
-    if (v < n) {
+    if (own) {
       const int h = mine >= 0 ? mine : static_cast<int>(v);
       hn[v]       = h;
       root[v]     = h == v ? static_cast<int>(v) : -1;
@@ -250,14 +210,15 @@ __global__ void refine_choose_kernel(const i64* __restrict__ indptr,
   }
 }
 
-// R7: inner_v = sum of counted w_vu with root_u = root_v and ord(u) < ord(v)
-// (0 for singleton trees; tree_offset gives the tree sizes).
+// R7: inner_v = sum of counted w_vu with root_u = root_v and ord(u) < ord(v);
+// rf = root | flipped << 31 makes the test one gather.
 template <WKind K>
 __global__ void refine_inner_kernel(const i64* __restrict__ indptr,
                                     const int* __restrict__ indices,
                                     EdgeW<K> w,
                                     const int* __restrict__ root,
                                     const unsigned char* __restrict__ flipped,
+                                    const int* __restrict__ rf,
                                     const int* __restrict__ tree_offset,
                                     i64 n,
                                     u64 ctx_order,
@@ -266,11 +227,13 @@ __global__ void refine_inner_kernel(const i64* __restrict__ indptr,
   const int lane   = threadIdx.x & (kWarp - 1);
   const i64 warp0  = static_cast<i64>(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarp;
   const i64 nwarps = static_cast<i64>(gridDim.x) * kWarpsPerBlock;
-  for (i64 base = warp0 * kWarp; base < n; base += nwarps * kWarp) {
-    const i64 v = base + lane;
+  const int rpw    = refine_rows_per_warp(n, nwarps);
+  for (i64 base = warp0 * rpw; base < n; base += nwarps * rpw) {
+    const i64 v    = base + lane;
+    const bool own = lane < rpw && v < n;
     i64 b = 0, e = 0, ov = 0;
     int rv = -1;  // -1: singleton tree (inner = 0)
-    if (v < n) {
+    if (own) {
       const int r0 = root[v];
       if (tree_offset[r0 + 1] - tree_offset[r0] > 1) {
         rv = r0;
@@ -279,7 +242,7 @@ __global__ void refine_inner_kernel(const i64* __restrict__ indptr,
         ov = refine_ord(ctx_order, static_cast<int>(v), flipped[v] != 0);
       }
     }
-    const int rows = n - base < kWarp ? static_cast<int>(n - base) : kWarp;
+    const int rows = n - base < rpw ? static_cast<int>(n - base) : rpw;
     i64 mine       = 0;
     for (int q = 0; q < rows; ++q) {
       const int rq = __shfl_sync(kFullMask, rv, q);
@@ -290,27 +253,24 @@ __global__ void refine_inner_kernel(const i64* __restrict__ indptr,
       const i64 vq = base + q;
       i64 acc      = 0;
       for (i64 j = bq + lane; j < eq; j += kWarp) {
-        const int u = indices[j];
-        if (u == vq || root[u] != rq) continue;
-        if (refine_ord(ctx_order, u, flipped[u] != 0) >= oq) continue;
-        const i64 x = w(j);
+        const int u = __ldcs(&indices[j]);
+        if (u == vq) continue;
+        const int ru = rf[u];
+        if ((ru & 0x7fffffff) != rq) continue;
+        if (refine_ord(ctx_order, u, ru < 0) >= oq) continue;
+        const i64 x = w.cs(j);
         if (x > 0) acc += x;
       }
       acc = warp_sum(acc);
       if (lane == q) mine = acc;
     }
-    if (v < n) inner[v] = mine;
+    if (own) inner[v] = mine;
   }
 }
 
-// ---------------------------------------------------------------------------
-// R3 / R4 / R5: forest extraction and grouping (thread per vertex)
-// ---------------------------------------------------------------------------
-
-// R3 (separate launch after R2): for hn_v != v chase towards lower f; if the
-// chase moved, root_v <- now and root_now <- now. It never reads root and
-// never writes -1, and a chase endpoint never moves itself, so every
-// interleaving gives the same root.
+// R3: for hn_v != v, chase towards lower f; if the chase moved, root_v and
+// root_now <- now. Roots are never read and -1 never written, and a chase
+// endpoint never moves, so every interleaving gives the same roots.
 __global__ void forest_chase1_kernel(const int* __restrict__ hn,
                                      i64 n,
                                      u64 ctx_order,
@@ -336,8 +296,7 @@ __global__ void forest_chase1_kernel(const int* __restrict__ hn,
   }
 }
 
-// R4a: flipped_v <- (root_v == -1), the snapshot R4b reads. Also zeroes the
-// tree counts [0, n] (R5) and the commit-class counters.
+// R4a: flipped <- (root == -1) (R4b's snapshot); zeroes the tree counters.
 __global__ void forest_flip_kernel(const int* __restrict__ root,
                                    i64 n,
                                    unsigned char* __restrict__ flipped,
@@ -349,12 +308,11 @@ __global__ void forest_flip_kernel(const int* __restrict__ root,
     tree_count[v] = 0;
     if (v < n) flipped[v] = root[v] == -1 ? 1 : 0;
   }
-  if (blockIdx.x == 0 && threadIdx.x < 4) ctl->tree_list_count[threadIdx.x] = 0;
+  if (blockIdx.x == 0 && threadIdx.x < 3) ctl->tree_list_count[threadIdx.x] = 0;
 }
 
 // R4b + R5 count: a flipped v chases while the current vertex is flipped and
-// ord decreases; the chase ends at a rooted (non-flipped) vertex, whose root
-// is final after R3 and never written here. Then tree_count[root_v] += 1.
+// ord decreases, to a rooted vertex (final root); tree_count[root_v] += 1.
 __global__ void forest_chase2_kernel(const int* __restrict__ hn,
                                      const unsigned char* __restrict__ flipped,
                                      i64 n,
@@ -394,13 +352,10 @@ __global__ void forest_chase2_kernel(const int* __restrict__ hn,
   }
 }
 
-// R5 scatter: members grouped by root (the cursor is the remaining count);
-// r_v <- v and kprime_v <- k_v (R8 overwrites the committed ones); roots of
-// trees with >= 2 members are listed by commit class; members of large trees
-// also write their segmented-sort key (ord) and value.
+// R5: members grouped by root, r_v <- v (R8 overwrites the committed ones),
+// trees of >= 2 members listed by class (large trees: segmented-sort input).
 __global__ void tree_scatter_kernel(const int* __restrict__ root,
                                     const unsigned char* __restrict__ flipped,
-                                    const i64* __restrict__ khat,
                                     const int* __restrict__ tree_offset,
                                     i64 n,
                                     u64 ctx_order,
@@ -408,15 +363,14 @@ __global__ void tree_scatter_kernel(const int* __restrict__ root,
                                     int* tree_count,
                                     int* __restrict__ members,
                                     int* __restrict__ r,
-                                    i64* __restrict__ kprime,
                                     int* __restrict__ tree_list,
                                     int* __restrict__ large_list,
                                     i64* __restrict__ seg_keys,
                                     int* __restrict__ seg_vals,
+                                    int* __restrict__ rf,
                                     Control* ctl)
 {
   const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
-  // whole warps iterate together (refine_list_append uses the full mask)
   for (i64 base = static_cast<i64>(blockIdx.x) * blockDim.x + (threadIdx.x & ~(kWarp - 1));
        base < n;
        base += stride) {
@@ -428,39 +382,29 @@ __global__ void tree_scatter_kernel(const int* __restrict__ root,
       const int size = tree_offset[rv + 1] - o;
       const int pos  = o + atomicSub(&tree_count[rv], 1) - 1;
       members[pos]   = static_cast<int>(v);
+      rf[v]          = rv | (flipped[v] ? static_cast<int>(0x80000000u) : 0);
       r[v]           = static_cast<int>(v);
-      kprime[v]      = khat[v];
-      if (size > tc.block) {
+      if (size > tc.warp) {
         seg_keys[pos] = refine_ord(ctx_order, static_cast<int>(v), flipped[v] != 0);
         seg_vals[pos] = static_cast<int>(v);
       }
       if (rv == v && size >= 2)
-        cls = size <= tc.thread  ? kTreeThread
-              : size <= tc.warp  ? kTreeWarp
-              : size <= tc.block ? kTreeBlock
-                                 : kTreeLarge;
+        cls = size <= tc.thread ? kTreeThread : size <= tc.warp ? kTreeWarp : kTreeLarge;
     }
     int* cnt     = ctl->tree_list_count;
     const int it = refine_list_append(cls == kTreeThread, &cnt[kTreeThread]);
     const int iw = refine_list_append(cls == kTreeWarp, &cnt[kTreeWarp]);
-    const int ib = refine_list_append(cls == kTreeBlock, &cnt[kTreeBlock]);
     const int il = refine_list_append(cls == kTreeLarge, &cnt[kTreeLarge]);
     if (it >= 0) tree_list[it] = static_cast<int>(v);
     if (iw >= 0) tree_list[n - 1 - iw] = static_cast<int>(v);
-    if (ib >= 0) large_list[n - 1 - ib] = static_cast<int>(v);
     if (il >= 0) large_list[il] = static_cast<int>(v);
   }
 }
 
-// ---------------------------------------------------------------------------
-// R8: longest valid prefix (exact T-test and gain test, §4.3)
-// ---------------------------------------------------------------------------
-
-// Member x at sorted position j >= 1 of a tree, with the prefix sums
-// (Kpre, EXTpre) over positions < j, joins iff the prefix is well connected
-// (EXTpre >= pen(Kpre, K_S - Kpre)) and joining gains (inner_x >= pen_x(Kpre)).
-// Because ord(root) is the tree minimum, inner_root = 0, so EXTpre is the
-// exclusive prefix sum of ext - 2 inner (the cut of the prefix in S).
+// R8: member x at sorted position j >= 1, with prefix sums (Kpre, EXTpre) over
+// positions < j, joins iff the prefix is well connected (EXTpre >= pen(Kpre,
+// K_S - Kpre)) and joining gains (inner_x >= pen_x(Kpre)). inner_root = 0, so
+// EXTpre is the exclusive prefix sum of ext - 2 inner.
 __device__ __forceinline__ bool refine_commit_ok(
   i64 kpre, i64 extpre, i64 ks, i64 kx, i64 ix, double lam)
 {
@@ -480,8 +424,7 @@ __device__ __forceinline__ T refine_warp_scan(T x)
   return incl - x;
 }
 
-// Ascending bitonic sort of (key, val) across the 32 lanes (keys unique, pads
-// carry kOrdPad).
+// Ascending bitonic sort of (key, val) across the lanes (pads carry kOrdPad).
 __device__ __forceinline__ void refine_warp_sort(u64& key, int& val)
 {
   const int lane = threadIdx.x & (kWarp - 1);
@@ -500,9 +443,7 @@ __device__ __forceinline__ void refine_warp_sort(u64& key, int& val)
   }
 }
 
-// Thread per tree of up to kTinyTree members (almost every tree of a kNN
-// level has 2-4 members): odd-even transposition sort of (ord, member) in
-// registers, then the prefix walk in ord order until the first failure.
+// Thread per tree of <= 8 members: odd-even sort in registers, prefix walk.
 __global__ void tree_commit_thread_kernel(const int* __restrict__ tree_list,
                                           const int* __restrict__ tree_offset,
                                           const int* __restrict__ members,
@@ -515,7 +456,6 @@ __global__ void tree_commit_thread_kernel(const int* __restrict__ tree_list,
                                           double lam,
                                           u64 ctx_order,
                                           int* __restrict__ r,
-                                          i64* __restrict__ kprime,
                                           Control* ctl)
 {
   const i64 count  = ctl->tree_list_count[kTreeThread];
@@ -568,12 +508,10 @@ __global__ void tree_commit_thread_kernel(const int* __restrict__ tree_list,
         }
       }
     }
-    kprime[x0] = kpre;
     if (x0 != t) atomicOr(&ctl->flags, kFlagForestInvariant);
   }
 }
 
-// Warp per tree of up to 32 members.
 __global__ void tree_commit_warp_kernel(const int* __restrict__ tree_list,
                                         i64 n,
                                         const int* __restrict__ tree_offset,
@@ -587,7 +525,6 @@ __global__ void tree_commit_warp_kernel(const int* __restrict__ tree_list,
                                         double lam,
                                         u64 ctx_order,
                                         int* __restrict__ r,
-                                        i64* __restrict__ kprime,
                                         Control* ctl)
 {
   const int lane   = threadIdx.x & (kWarp - 1);
@@ -620,103 +557,11 @@ __global__ void tree_commit_warp_kernel(const int* __restrict__ tree_list,
     const unsigned fail = __ballot_sync(kFullMask, !ok);
     const int p         = fail ? __ffs(fail) - 1 : size;
     if (valid && lane >= 1 && lane < p) r[x] = x0;
-    // k_hat' of the host x0: the prefix sum at p (the total if no failure)
-    const i64 kp = __shfl_sync(kFullMask, kpre + kx, p - 1);
-    if (lane == 0) {
-      kprime[x0] = kp;
-      if (x0 != t) atomicOr(&ctl->flags, kFlagForestInvariant);
-    }
+    if (lane == 0 && x0 != t) atomicOr(&ctl->flags, kFlagForestInvariant);
   }
 }
 
-// Block per tree of up to kCommitBlock * kCommitItems members.
-__global__ void __launch_bounds__(kCommitBlock)
-  tree_commit_block_kernel(const int* __restrict__ large_list,
-                           i64 n,
-                           const int* __restrict__ tree_offset,
-                           const int* __restrict__ members,
-                           const unsigned char* __restrict__ flipped,
-                           const i64* __restrict__ khat,
-                           const i64* __restrict__ ext,
-                           const i64* __restrict__ inner,
-                           const int* __restrict__ S,
-                           const i64* __restrict__ KS,
-                           double lam,
-                           u64 ctx_order,
-                           int* __restrict__ r,
-                           i64* __restrict__ kprime,
-                           Control* ctl)
-{
-  using Sort = cub::BlockRadixSort<u64, kCommitBlock, kCommitItems, int>;
-  using Scan = cub::BlockScan<i64, kCommitBlock>;
-  __shared__ union {
-    typename Sort::TempStorage sort;
-    typename Scan::TempStorage scan;
-  } tmp;
-  __shared__ int s_x0;
-  __shared__ int s_fail;
-  const int tid   = threadIdx.x;
-  const i64 count = ctl->tree_list_count[kTreeBlock];
-  for (i64 i = blockIdx.x; i < count; i += gridDim.x) {
-    const int t    = large_list[n - 1 - i];
-    const int o    = tree_offset[t];
-    const int size = tree_offset[t + 1] - o;
-    u64 key[kCommitItems];
-    int x[kCommitItems];
-#pragma unroll
-    for (int k = 0; k < kCommitItems; ++k) {
-      const int j = tid * kCommitItems + k;
-      key[k]      = kOrdPad;
-      x[k]        = -1;
-      if (j < size) {
-        x[k]   = members[o + j];
-        key[k] = static_cast<u64>(refine_ord(ctx_order, x[k], flipped[x[k]] != 0));
-      }
-    }
-    if (tid == 0) s_fail = INT_MAX;
-    Sort(tmp.sort).Sort(key, x, 0, kOrdBits);
-    __syncthreads();
-    i64 kx[kCommitItems], dx[kCommitItems], ix[kCommitItems];
-#pragma unroll
-    for (int k = 0; k < kCommitItems; ++k) {
-      const int j = tid * kCommitItems + k;
-      kx[k] = dx[k] = ix[k] = 0;
-      if (j < size) {
-        kx[k] = khat[x[k]];
-        ix[k] = inner[x[k]];
-        dx[k] = ext[x[k]] - 2 * ix[k];
-      }
-    }
-    if (tid == 0) s_x0 = x[0];
-    i64 kpre[kCommitItems], extpre[kCommitItems];
-    Scan(tmp.scan).ExclusiveSum(kx, kpre);
-    __syncthreads();
-    Scan(tmp.scan).ExclusiveSum(dx, extpre);
-    __syncthreads();
-    const int x0 = s_x0;
-    const i64 ks = KS[S[x0]];
-#pragma unroll
-    for (int k = 0; k < kCommitItems; ++k) {
-      const int j = tid * kCommitItems + k;
-      if (j >= 1 && j < size && !refine_commit_ok(kpre[k], extpre[k], ks, kx[k], ix[k], lam))
-        atomicMin(&s_fail, j);
-    }
-    __syncthreads();
-    const int p = s_fail < size ? s_fail : size;
-#pragma unroll
-    for (int k = 0; k < kCommitItems; ++k) {
-      const int j = tid * kCommitItems + k;
-      if (j >= 1 && j < p) r[x[k]] = x0;
-      if (j == p - 1) kprime[x0] = kpre[k] + kx[k];
-    }
-    if (tid == 0 && x0 != t) atomicOr(&ctl->flags, kFlagForestInvariant);
-    __syncthreads();
-  }
-}
-
-// Block per large tree: members already sorted by ord (segmented sort) in
-// sorted_vals[tree_offset[t] ...); chunks of kCommitBlock members with carried
-// prefix sums until the first failure.
+// Block per large tree (members sorted by ord): chunks with carried prefixes.
 __global__ void __launch_bounds__(kCommitBlock)
   tree_commit_large_kernel(const int* __restrict__ large_list,
                            const int* __restrict__ tree_offset,
@@ -728,7 +573,6 @@ __global__ void __launch_bounds__(kCommitBlock)
                            const i64* __restrict__ KS,
                            double lam,
                            int* __restrict__ r,
-                           i64* __restrict__ kprime,
                            Control* ctl)
 {
   using Scan = cub::BlockScan<i64, kCommitBlock>;
@@ -743,7 +587,6 @@ __global__ void __launch_bounds__(kCommitBlock)
     const int x0   = sorted_vals[o];
     const i64 ks   = KS[S[x0]];
     i64 carry_k = 0, carry_d = 0;
-    int p = size;
     for (int c0 = 0; c0 < size; c0 += kCommitBlock) {
       const int j      = c0 + tid;
       const bool valid = j < size;
@@ -766,26 +609,17 @@ __global__ void __launch_bounds__(kCommitBlock)
       __syncthreads();
       const int f = s_fail;
       if (valid && j >= 1 && j < f) r[x] = x0;
-      if (j == f) kprime[x0] = kpre;
       __syncthreads();
-      if (f != INT_MAX) {  // block-uniform
-        p = f;
-        break;
-      }
+      if (f != INT_MAX) break;  // block-uniform
       carry_k += tk;
       carry_d += td;
     }
-    if (tid == 0) {
-      if (p == size) kprime[x0] = carry_k;
-      if (x0 != t) atomicOr(&ctl->flags, kFlagForestInvariant);
-    }
+    if (tid == 0 && x0 != t) atomicOr(&ctl->flags, kFlagForestInvariant);
     __syncthreads();
   }
 }
 
-// Segment offsets of the large trees for DeviceSegmentedSort: segment i is
-// tree large_list[i] for i < count, empty otherwise (the host knows only the
-// bound n / (block + 1) on the number of large trees).
+// Segments of the large trees for DeviceSegmentedSort.
 struct LargeSegmentBegin {
   const int* list;
   const int* count;
@@ -799,10 +633,6 @@ struct LargeSegmentEnd {
   __host__ __device__ int operator()(int i) const { return i < *count ? offset[list[i] + 1] : 0; }
 };
 
-// ---------------------------------------------------------------------------
-// R9: hosts, coarse ids, cmap
-// ---------------------------------------------------------------------------
-
 __global__ void host_flags_kernel(const int* __restrict__ r, i64 n, int* __restrict__ flags)
 {
   const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
@@ -810,8 +640,7 @@ __global__ void host_flags_kernel(const int* __restrict__ r, i64 n, int* __restr
     flags[v] = v < n && r[v] == v ? 1 : 0;
 }
 
-// cmap_v = cid[r_v], the rank of v's host among the hosts (P-independent and
-// monotone); n_{l+1} = cid[n], device-resident until SL2.
+// R9: cmap_v = cid[r_v]; n_{l+1} = cid[n].
 __global__ void cmap_kernel(const int* __restrict__ r,
                             const int* __restrict__ cid,
                             i64 n,
@@ -824,10 +653,6 @@ __global__ void cmap_kernel(const int* __restrict__ r,
   if (blockIdx.x == 0 && threadIdx.x == 0) ctl->n_next = cid[n];
 }
 
-// ---------------------------------------------------------------------------
-// Host runner
-// ---------------------------------------------------------------------------
-
 struct RefineParams {
   double lam    = 0.0;  // lambda_hat = gamma / 2m_hat
   u64 ctx_order = 0;    // ctx(seed64, ORDER, it, l, 0, 0)
@@ -837,17 +662,13 @@ struct RefineParams {
 inline void refine_check_cub(std::size_t need, std::size_t have, const char* what)
 {
   CUGRAPH_EXPECTS(need <= have,
-                  "leiden: CUB temp storage for %s exceeds the "
-                  "carved region.",
+                  "leiden: internal error: CUB temp storage for %s exceeds the carved region.",
                   what);
 }
 
-// PLEIDEN_R on a level graph (indptr, indices, w) with n vertices, vertex
-// weights khat, compacted move partition S (ids in [0, C)) and its volumes
-// KS. Writes cmap (n entries: the caller's level-arena slot) and ctl->n_next
-// (device-resident; the driver reads it at SL2). No host synchronisation.
-// rb keeps every intermediate array (ext, U, hn, root, flipped, inner, r,
-// kprime, ...) until the aggregate phase reuses the bytes.
+// PLEIDEN_R of a level with move partition S (ids < C) and volumes KS: cmap
+// and ctl->n_next without a host sync. `pre` (COMPACT) and R1-R8 run as one
+// call list, R9's calls go to `tail` (AGGREGATE stage 1) or launch.
 template <WKind K>
 void run_refine(const i64* indptr,
                 const int* indices,
@@ -863,114 +684,161 @@ void run_refine(const i64* indptr,
                 void* cub,
                 std::size_t cub_bytes,
                 Control* ctl,
-                cudaStream_t s)
+                cudaStream_t s,
+                const i64* C_dev              = nullptr,
+                GraphChain* graph             = nullptr,
+                std::vector<KernelCall>* tail = nullptr,
+                std::vector<KernelCall> pre   = {})
 {
   if (n == 0) {
+    launch_chain(pre, nullptr, s);
     RAFT_CUDA_TRY(cudaMemsetAsync(&ctl->n_next, 0, sizeof(i64), s));
     return;
   }
-  // row kernels: one warp per 32 rows (group prefetch)
-  const unsigned gr = grid_items(n), gi = grid_items(n);
-  // R1, R2
-  refine_ext_u_kernel<K>
-    <<<gr, kBlock, 0, s>>>(indptr, indices, w, khat, S, KS, n, C, rp.lam, rb.ext, rb.U, ctl);
-  RAFT_CHECK_CUDA(s);
-  refine_choose_kernel<K>
-    <<<gr, kBlock, 0, s>>>(indptr, indices, w, khat, S, rb.U, n, rp.lam, rb.hn, rb.root);
-  RAFT_CHECK_CUDA(s);
-  // R3 (separate launch), R4, R5
-  forest_chase1_kernel<<<gi, kBlock, 0, s>>>(rb.hn, n, rp.ctx_order, rb.root);
-  RAFT_CHECK_CUDA(s);
-  forest_flip_kernel<<<grid_items(n + 1), kBlock, 0, s>>>(
-    rb.root, n, rb.flipped, rb.tree_count, ctl);
-  RAFT_CHECK_CUDA(s);
-  forest_chase2_kernel<<<gi, kBlock, 0, s>>>(
-    rb.hn, rb.flipped, n, rp.ctx_order, rb.root, rb.tree_count, ctl);
-  RAFT_CHECK_CUDA(s);
-  std::size_t tb = cub_bytes;
-  RAFT_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
-    cub, tb, rb.tree_count, rb.tree_offset, cub_items(n + 1, "tree offsets"), s));
-  tree_scatter_kernel<<<gi, kBlock, 0, s>>>(rb.root,
-                                            rb.flipped,
-                                            khat,
-                                            rb.tree_offset,
-                                            n,
-                                            rp.ctx_order,
-                                            rp.trees,
-                                            rb.tree_count,
-                                            rb.members,
-                                            rb.r,
-                                            rb.kprime,
-                                            rb.tree_list,
-                                            rb.large_list,
-                                            rb.sort_keys_a,
-                                            rb.sort_vals_a,
-                                            ctl);
-  RAFT_CHECK_CUDA(s);
-  // R7
-  refine_inner_kernel<K><<<gr, kBlock, 0, s>>>(
-    indptr, indices, w, rb.root, rb.flipped, rb.tree_offset, n, rp.ctx_order, rb.inner);
-  RAFT_CHECK_CUDA(s);
-  // R8: every class runs over a device-resident count (no host sync); a
-  // class whose trees cannot exist at this n is not launched.
-  const TreeClasses& tc = rp.trees;
-  if (n >= 2) {
-    tree_commit_thread_kernel<<<grid_items(n / 2 + 1), kBlock, 0, s>>>(rb.tree_list,
-                                                                       rb.tree_offset,
-                                                                       rb.members,
-                                                                       rb.flipped,
-                                                                       khat,
-                                                                       rb.ext,
-                                                                       rb.inner,
-                                                                       S,
-                                                                       KS,
-                                                                       rp.lam,
-                                                                       rp.ctx_order,
-                                                                       rb.r,
-                                                                       rb.kprime,
-                                                                       ctl);
-    RAFT_CHECK_CUDA(s);
-  }
-  if (n > tc.thread) {
-    tree_commit_warp_kernel<<<grid_rows(n / (tc.thread + 1) + 1), kBlock, 0, s>>>(rb.tree_list,
-                                                                                  n,
-                                                                                  rb.tree_offset,
-                                                                                  rb.members,
-                                                                                  rb.flipped,
-                                                                                  khat,
-                                                                                  rb.ext,
-                                                                                  rb.inner,
-                                                                                  S,
-                                                                                  KS,
-                                                                                  rp.lam,
-                                                                                  rp.ctx_order,
-                                                                                  rb.r,
-                                                                                  rb.kprime,
-                                                                                  ctl);
-    RAFT_CHECK_CUDA(s);
-  }
-  if (n > tc.warp) {
-    const i64 max_trees = n / (tc.warp + 1);
-    tree_commit_block_kernel<<<grid_for(max_trees, 1, kCommitBlock), kCommitBlock, 0, s>>>(
-      rb.large_list,
-      n,
-      rb.tree_offset,
-      rb.members,
-      rb.flipped,
-      khat,
-      rb.ext,
-      rb.inner,
-      S,
-      KS,
-      rp.lam,
-      rp.ctx_order,
-      rb.r,
-      rb.kprime,
-      ctl);
-    RAFT_CHECK_CUDA(s);
-  }
-  if (n > tc.block) {
-    const int max_large = static_cast<int>(n / (static_cast<i64>(tc.block) + 1));
+  const unsigned gi         = grid_items(n);
+  const TreeClasses& tc     = rp.trees;
+  std::vector<KernelCall> c = std::move(pre);
+  std::size_t k             = c.size();
+  c.resize(k + 16);
+  // rb.cid (free until R9) carries SU from R1 to R2 and rf from R5 to R7
+  c[k++].set(true,
+             refine_ext_u_kernel<K>,
+             dim3(grid_occ(refine_ext_u_kernel<K>, n, kWarpsPerBlock)),
+             dim3(kBlock),
+             0,
+             indptr,
+             indices,
+             w,
+             khat,
+             S,
+             KS,
+             n,
+             C,
+             C_dev,
+             rp.lam,
+             rb.ext,
+             rb.U,
+             rb.cid,
+             ctl);
+  c[k++].set(true,
+             refine_choose_kernel<K>,
+             dim3(grid_occ(refine_choose_kernel<K>, n, kWarpsPerBlock)),
+             dim3(kBlock),
+             0,
+             indptr,
+             indices,
+             w,
+             khat,
+             S,
+             rb.U,
+             rb.cid,
+             n,
+             rp.lam,
+             rb.hn,
+             rb.root);
+  c[k++].set(
+    true, forest_chase1_kernel, dim3(gi), dim3(kBlock), 0, rb.hn, n, rp.ctx_order, rb.root);
+  c[k++].set(true,
+             forest_flip_kernel,
+             dim3(grid_items(n + 1)),
+             dim3(kBlock),
+             0,
+             rb.root,
+             n,
+             rb.flipped,
+             rb.tree_count,
+             ctl);
+  c[k++].set(true,
+             forest_chase2_kernel,
+             dim3(gi),
+             dim3(kBlock),
+             0,
+             rb.hn,
+             rb.flipped,
+             n,
+             rp.ctx_order,
+             rb.root,
+             rb.tree_count,
+             ctl);
+  scan_calls(&c[k], ScanArray<int, int>{rb.tree_count}, rb.tree_offset, n + 1, cub, cub_bytes);
+  k += 3;
+  c[k++].set(true,
+             tree_scatter_kernel,
+             dim3(gi),
+             dim3(kBlock),
+             0,
+             rb.root,
+             rb.flipped,
+             rb.tree_offset,
+             n,
+             rp.ctx_order,
+             rp.trees,
+             rb.tree_count,
+             rb.members,
+             rb.r,
+             rb.tree_list,
+             rb.large_list,
+             rb.sort_keys_a,
+             rb.sort_vals_a,
+             rb.cid,
+             ctl);
+  c[k++].set(true,
+             refine_inner_kernel<K>,
+             dim3(grid_occ(refine_inner_kernel<K>, n, kWarpsPerBlock)),
+             dim3(kBlock),
+             0,
+             indptr,
+             indices,
+             w,
+             rb.root,
+             rb.flipped,
+             rb.cid,
+             rb.tree_offset,
+             n,
+             rp.ctx_order,
+             rb.inner);
+  // R8 classes over device-resident counts (impossible classes disabled)
+  c[k++].set(n >= 2,
+             tree_commit_thread_kernel,
+             dim3(grid_occ(tree_commit_thread_kernel, n / 2 + 1, kBlock)),
+             dim3(kBlock),
+             0,
+             rb.tree_list,
+             rb.tree_offset,
+             rb.members,
+             rb.flipped,
+             khat,
+             rb.ext,
+             rb.inner,
+             S,
+             KS,
+             rp.lam,
+             rp.ctx_order,
+             rb.r,
+             ctl);
+  c[k++].set(n > tc.thread,
+             tree_commit_warp_kernel,
+             dim3(grid_rows(n / (tc.thread + 1) + 1)),
+             dim3(kBlock),
+             0,
+             rb.tree_list,
+             n,
+             rb.tree_offset,
+             rb.members,
+             rb.flipped,
+             khat,
+             rb.ext,
+             rb.inner,
+             S,
+             KS,
+             rp.lam,
+             rp.ctx_order,
+             rb.r,
+             ctl);
+  c.resize(static_cast<std::size_t>(k));
+  launch_chain(c, graph, s);
+  if (n > tc.warp) {  // trees larger than a warp can exist
+    const int max_large = static_cast<int>(n / (static_cast<i64>(tc.warp) + 1));
     const int* cnt      = &ctl->tree_list_count[kTreeLarge];
     auto begin          = thrust::make_transform_iterator(
       thrust::counting_iterator<int>(0), LargeSegmentBegin{rb.large_list, cnt, rb.tree_offset});
@@ -990,7 +858,7 @@ void run_refine(const i64* indptr,
                                                       end,
                                                       s));
     refine_check_cub(need, cub_bytes, "the large-tree sort");
-    tb = cub_bytes;
+    std::size_t tb = cub_bytes;
     RAFT_CUDA_TRY(cub::DeviceSegmentedSort::SortPairs(cub,
                                                       tb,
                                                       rb.sort_keys_a,
@@ -1013,18 +881,20 @@ void run_refine(const i64* indptr,
       KS,
       rp.lam,
       rb.r,
-      rb.kprime,
       ctl);
     RAFT_CHECK_CUDA(s);
   }
-  // R9 (the host flags reuse tree_count: the scatter cursors are spent)
-  host_flags_kernel<<<grid_items(n + 1), kBlock, 0, s>>>(rb.r, n, rb.tree_count);
-  RAFT_CHECK_CUDA(s);
-  tb = cub_bytes;
-  RAFT_CUDA_TRY(cub::DeviceScan::ExclusiveSum(
-    cub, tb, rb.tree_count, rb.cid, cub_items(n + 1, "coarse ids"), s));
-  cmap_kernel<<<gi, kBlock, 0, s>>>(rb.r, rb.cid, n, cmap, ctl);
-  RAFT_CHECK_CUDA(s);
+  // R9 (the host flags reuse tree_count)
+  std::vector<KernelCall> r9(5);
+  r9[0].set(
+    true, host_flags_kernel, dim3(grid_items(n + 1)), dim3(kBlock), 0, rb.r, n, rb.tree_count);
+  scan_calls(&r9[1], ScanArray<int, int>{rb.tree_count}, rb.cid, n + 1, cub, cub_bytes);
+  r9[4].set(true, cmap_kernel, dim3(gi), dim3(kBlock), 0, rb.r, rb.cid, n, cmap, ctl);
+  if (tail) {
+    tail->insert(tail->end(), r9.begin(), r9.end());
+  } else {
+    launch_chain(r9, nullptr, s);
+  }
 }
 
 }  // namespace cugraph::detail::leiden_engine

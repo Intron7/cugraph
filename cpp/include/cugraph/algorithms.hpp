@@ -635,9 +635,7 @@ void flatten_dendrogram(raft::handle_t const& handle,
  * @ingroup community_cpp
  * @brief Parameters of cugraph::leiden().
  *
- * The defaults are the recommended configuration (two Leiden iterations, as igraph). Every field
- * except @p low_memory can change the result; @p low_memory only changes the memory layout and
- * gives bitwise identical results.
+ * The defaults are the recommended configuration (two Leiden iterations, as igraph).
  */
 struct leiden_params_t {
   /// Resolution (gamma) of the modularity objective Q(gamma). Higher resolutions lead to more,
@@ -655,10 +653,6 @@ struct leiden_params_t {
   /// 5-12. An iteration that reaches the cap continues from the local-moving partition of its
   /// last level, projected to the input graph.
   size_t max_level{64};
-  /// Advanced: contract every level in two passes, which roughly halves the peak workspace at a
-  /// small speed cost (layout only: the result is bitwise identical). Used automatically if the
-  /// workspace allocation fails.
-  bool low_memory{false};
 };
 
 /**
@@ -701,13 +695,14 @@ struct leiden_result_t {
  *  - Every returned community is connected.
  *  - The returned modularity is the exact (fp64) Q(resolution) of the returned clustering.
  *  - Deterministic: all decisions are made in exact 64-bit fixed-point arithmetic with total-order
- *    tie breaks and counter-based hashes instead of a random number generator. Identical inputs,
- *    parameters and seed give the bitwise identical clustering and modularity, independently of
- *    the GPU, thread scheduling, @p params.low_memory, vertex_t / edge_t, weight_t (as long as the
- *    weight values are equal) and, for multi-GPU, the number of GPUs. Vertex ids enter the
- *    hashes, so a different vertex numbering (e.g. renumbering) gives a different, equally valid
- *    clustering. For a graph built with renumber = false from the same CSR, the result is bitwise
- *    identical to rapids_singlecell.tl.leiden(flavor="rapids") with the same 32-bit seed.
+ *    tie breaks and counter-based hashes instead of a random number generator, every rounded
+ *    floating-point operation is explicit (`_rn` intrinsics, compiled with --fmad=false), and the
+ *    modularity is summed in a fixed order. Identical inputs, parameters and seed therefore give
+ *    the bitwise identical clustering and modularity, independently of thread scheduling and
+ *    launch configuration, vertex_t / edge_t, weight_t (as long as the weight values are equal)
+ *    and, for multi-GPU, the number of GPUs; by construction this also holds across GPU
+ *    architectures. Vertex ids enter the hashes, so a different vertex numbering (e.g.
+ *    renumbering) gives a different, equally valid clustering.
  *
  * Edge semantics: the graph must be symmetric (every undirected edge stored in both directions
  * with the same weight; the data is checked, not the is_symmetric() flag). Weights must be finite
@@ -715,13 +710,13 @@ struct leiden_result_t {
  * degrees nor to the modularity). Parallel edges are summed (in fp64, in a canonical order). If
  * @p edge_weight_view is std::nullopt, every edge has weight 1.
  *
- * Memory: one workspace allocation per call from the current RMM device memory resource (about
- * 3.5x the size of the CSR; 2.9x with @p params.low_memory, which is also used automatically if
- * the first allocation fails), plus 4 KB of control scalars; nothing is allocated inside the
- * iterations. A graph with parallel edges or unsorted rows is first copied into a canonical CSR.
- * The stream of @p handle is synchronized a few times per local-moving sweep to read back the
- * control scalars, through a pinned buffer of cugraph::host_staging_buffer_manager when it is
- * initialized.
+ * Memory and launches: one workspace allocation per call from the current RMM device memory
+ * resource (about 2.7x the size of the CSR with int32 ids and float weights), plus 4 KB of
+ * control scalars; nothing is allocated inside the iterations. A graph with parallel edges or
+ * unsorted rows is first copied into a canonical CSR. The kernels run on the stream of
+ * @p handle, most of them as CUDA graphs; the stream is synchronized a few times per level to read
+ * back control scalars (through a pinned buffer of cugraph::host_staging_buffer_manager when it is
+ * initialized).
  *
  * Multi-GPU: the current implementation all-gathers the edge list of the distributed graph to
  * every GPU and runs the single-GPU algorithm on every rank (graphs must fit on one GPU: about

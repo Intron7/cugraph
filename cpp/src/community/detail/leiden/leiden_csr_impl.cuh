@@ -24,7 +24,6 @@
 
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
-#include <rmm/error.hpp>
 
 #include <thrust/binary_search.h>
 #include <thrust/copy.h>
@@ -43,30 +42,18 @@
 namespace cugraph {
 namespace detail {
 
-// Workspace sizing (spec §6.3): the level arena holds arena_factor * 8 B per input entry. A
-// level that does not fit is contracted in two passes; only if even that fails is the call
-// repeated on a larger workspace (at most leiden_max_reruns times; the layout never reaches a
-// decision, so every rerun gives the bitwise identical result).
-constexpr double leiden_arena_factor            = 1.9;
-constexpr double leiden_arena_factor_low_memory = 1.3;  // two-pass levels need no holey region
-constexpr double leiden_workspace_growth        = 2.0;
-constexpr double leiden_required_slack          = 1.25;
-constexpr int leiden_max_reruns                 = 6;
+// Workspace sizing: the level arena holds arena_factor * 8 B per input entry
+// (leiden_layout_options_t::arena_factor, 1.9 by default, which fits every level of the k-NN
+// graphs we measured). A level that does not fit ends the engine call, which is then repeated on a
+// larger workspace (at most leiden_max_reruns times; the layout never reaches a decision, so every
+// rerun gives the bitwise identical result).
+constexpr double leiden_workspace_growth = 2.0;
+constexpr double leiden_required_slack   = 1.25;
+constexpr int leiden_max_reruns          = 6;
 
-// Raw CUDA stream of a stream view (rmm::cuda_stream_view::value(), or get() on newer RMM).
-template <typename stream_view_t>
-cudaStream_t leiden_raw_stream(stream_view_t stream)
-{
-  if constexpr (requires { stream.get(); }) {
-    return stream.get();
-  } else {
-    return stream.value();
-  }
-}
-
-// Layout, workspace (with the OOM and regrow retries), I2 (+ I4) and the engine on a CSR that
-// passed I1 (`info`) as canonical and symmetric. <IP, IX, WI> are the types of the arrays the
-// engine reads at level 0 (the input CSR, or its canonicalized copy).
+// Layout, workspace (with the regrow retries), I2 (+ I4) and the engine on a CSR that passed I1
+// (`info`) as canonical and symmetric. <IP, IX, WI> are the types of the arrays the engine reads
+// at level 0 (the input CSR, or its canonicalized copy).
 template <typename IP, typename IX, typename WI, typename vertex_t>
 leiden_result_t leiden_level0(raft::handle_t const& handle,
                               uint32_t seed,
@@ -78,10 +65,11 @@ leiden_result_t leiden_level0(raft::handle_t const& handle,
                               leiden_engine::IngestInfo const& info,
                               void* pinned,
                               raft::device_span<vertex_t> labels,
-                              leiden_params_t const& params)
+                              leiden_params_t const& params,
+                              leiden_layout_options_t const& options)
 {
   namespace le              = leiden_engine;
-  cudaStream_t const stream = leiden_raw_stream(handle.get_stream());
+  cudaStream_t const stream = handle.get_stream().get();
   bool const weighted       = data != nullptr;
 
   le::LayoutParams p{};
@@ -91,35 +79,23 @@ leiden_result_t leiden_level0(raft::handle_t const& handle,
   p.wkind        = le::level0_kind(info.flags, weighted, std::is_same_v<WI, float>, s);
   p.idx64_input  = !std::is_same_v<IX, int>;
   p.replicas     = le::n_replicas(info.n_counted);
-  p.low_memory   = params.low_memory;
-  p.arena_factor = params.low_memory ? leiden_arena_factor_low_memory : leiden_arena_factor;
+  p.arena_factor = options.arena_factor;
   p.subrounds    = le::kNumSubrounds;
 
   le::EngineParams ep{};
   ep.n_iterations = params.n_iterations;
   ep.max_levels   = static_cast<int>(params.max_level);
-  ep.low_memory   = params.low_memory;
+  ep.graph_mode   = options.graph_mode;
 
-  // int32 labels of the engine: the output itself for int32 vertex ids, otherwise the workspace
-  // (int64 input indices) or a separate buffer (int64 vertex ids, canonicalized int32 copy).
+  // int32 labels of the engine: the output itself for int32 vertex ids, else a separate buffer.
   std::optional<rmm::device_uvector<int>> labels32_buffer{std::nullopt};
   if constexpr (!std::is_same_v<vertex_t, int32_t>) {
-    if (!p.idx64_input) labels32_buffer.emplace(n, handle.get_stream());
+    labels32_buffer.emplace(n, handle.get_stream());
   }
 
   for (int run = 0;; ++run) {
-    std::optional<rmm::device_buffer> workspace{std::nullopt};
-    try {
-      workspace.emplace(le::workspace_bytes(p), handle.get_stream());
-    } catch (rmm::out_of_memory const&) {
-      if (p.low_memory) throw;
-      // Two-pass contraction needs less memory; layout only, so the result is identical.
-      p.low_memory   = true;
-      ep.low_memory  = true;
-      p.arena_factor = std::min(p.arena_factor, leiden_arena_factor_low_memory);
-      continue;
-    }
-    le::Layout L = le::make_layout(p, workspace->data());
+    rmm::device_buffer workspace(le::workspace_bytes(p), handle.get_stream());
+    le::Layout L = le::make_layout(p, workspace.data());
     L.pinned     = pinned;
 
     // I2 (+ I4): level 0 in the engine's internal form, quantised for this resolution.
@@ -137,23 +113,16 @@ leiden_result_t leiden_level0(raft::handle_t const& handle,
                                           le::ClassThresholds{},
                                           stream);
     });
-    if (!q.ok) {  // cannot happen with the layout derived above; handled for robustness
-      CUGRAPH_EXPECTS(run < leiden_max_reruns, "leiden: inconsistent workspace layout.");
-      p.wkind       = q.required_wkind;
-      p.idx64_input = q.required_idx64_input;
-      continue;
-    }
 
     int* labels32{nullptr};
     if constexpr (std::is_same_v<vertex_t, int32_t>) {
       labels32 = labels.data();
     } else {
-      labels32 = labels32_buffer ? labels32_buffer->data() : L.persist.labels32;
+      labels32 = labels32_buffer->data();
     }
     le::EngineResult r{};
     if (le::run_engine(L, q, ep, params.resolution, seed, labels32, stream, r)) {
       if constexpr (!std::is_same_v<vertex_t, int32_t>) {
-        // widen before the workspace (which may hold labels32) is released
         thrust::copy(handle.get_thrust_policy(), labels32, labels32 + n, labels.begin());
       }
       return leiden_result_t{static_cast<size_t>(r.n_clusters),
@@ -161,13 +130,12 @@ leiden_result_t leiden_level0(raft::handle_t const& handle,
                              static_cast<size_t>(r.num_iterations),
                              static_cast<size_t>(r.num_levels)};
     }
-    // The level arena overflowed even with two-pass levels (rare): free the workspace first, so
-    // the peak never holds two, then grow the arena.
+    // A level did not fit into the level arena (rare): grow the arena (the workspace is released
+    // at the end of this iteration, before the next one allocates).
     CUGRAPH_EXPECTS(run < leiden_max_reruns,
                     "leiden: the level arena overflowed %d times in a row.",
                     leiden_max_reruns + 1);
     double const required = le::arena_required_factor(p, L.arena.required);
-    workspace.reset();
     p.arena_factor =
       std::max(leiden_workspace_growth * p.arena_factor, leiden_required_slack * required);
   }
@@ -180,7 +148,8 @@ leiden_result_t leiden_csr(raft::handle_t const& handle,
                            raft::device_span<vertex_t const> indices,
                            std::optional<raft::device_span<weight_t const>> weights,
                            raft::device_span<vertex_t> labels,
-                           leiden_params_t const& params)
+                           leiden_params_t const& params,
+                           leiden_layout_options_t const& options)
 {
   namespace le = leiden_engine;
   static_assert(std::is_same_v<vertex_t, int32_t> || std::is_same_v<vertex_t, int64_t>);
@@ -198,9 +167,13 @@ leiden_result_t leiden_csr(raft::handle_t const& handle,
                   "Invalid input argument: labels must have one entry per vertex.");
   CUGRAPH_EXPECTS(!weights || static_cast<int64_t>(weights->size()) == nnz,
                   "Invalid input argument: the edge weights do not match the edges.");
+  CUGRAPH_EXPECTS(options.graph_mode >= 0 && options.graph_mode <= 2,
+                  "Invalid input argument: graph_mode must be 0, 1 or 2.");
+  CUGRAPH_EXPECTS(options.arena_factor > 0.0 && std::isfinite(options.arena_factor),
+                  "Invalid input argument: arena_factor must be finite and > 0.");
   if (n == 0) return leiden_result_t{};
 
-  cudaStream_t const stream = leiden_raw_stream(handle.get_stream());
+  cudaStream_t const stream = handle.get_stream().get();
   weight_t const* data      = weights ? weights->data() : nullptr;
 
   // Readback mailbox of the control block: pinned when cuGraph's staging pool is set up,
@@ -281,7 +254,8 @@ leiden_result_t leiden_csr(raft::handle_t const& handle,
                                                          info,
                                                          pinned,
                                                          labels,
-                                                         params);
+                                                         params,
+                                                         options);
   }
 
   check_symmetric(info);
@@ -289,8 +263,18 @@ leiden_result_t leiden_csr(raft::handle_t const& handle,
     thrust::sequence(handle.get_thrust_policy(), labels.begin(), labels.end(), vertex_t{0});
     return leiden_result_t{static_cast<size_t>(n), 0.0, 0, 0};
   }
-  return leiden_level0<edge_t, vertex_t, weight_t, vertex_t>(
-    handle, seed, offsets.data(), indices.data(), data, n, nnz, info, pinned, labels, params);
+  return leiden_level0<edge_t, vertex_t, weight_t, vertex_t>(handle,
+                                                             seed,
+                                                             offsets.data(),
+                                                             indices.data(),
+                                                             data,
+                                                             n,
+                                                             nnz,
+                                                             info,
+                                                             pinned,
+                                                             labels,
+                                                             params,
+                                                             options);
 }
 
 // leiden_coo packs an edge (src, dst) into one 64-bit sort key; n < 2^30.
@@ -331,7 +315,8 @@ leiden_result_t leiden_coo(raft::handle_t const& handle,
                            rmm::device_uvector<vertex_t>&& dsts,
                            std::optional<rmm::device_uvector<weight_t>>&& weights,
                            raft::device_span<vertex_t> labels,
-                           leiden_params_t const& params)
+                           leiden_params_t const& params,
+                           leiden_layout_options_t const& options)
 {
   check_leiden_params(params);
   auto const n   = static_cast<int64_t>(num_vertices);
@@ -351,8 +336,10 @@ leiden_result_t leiden_coo(raft::handle_t const& handle,
                     dsts.begin(),
                     keys.begin(),
                     leiden_pack_edge_t<vertex_t>{num_vertices});
-  srcs.release();
-  dsts.release();
+  srcs.resize(0, stream);
+  srcs.shrink_to_fit(stream);
+  dsts.resize(0, stream);
+  dsts.shrink_to_fit(stream);
 
   // Rows sorted by column: the CSR depends only on the multiset of edges, not on their order.
   // (Parallel edges end up adjacent in an order that depends on the input order; leiden_csr sums
@@ -379,7 +366,8 @@ leiden_result_t leiden_coo(raft::handle_t const& handle,
                     keys.end(),
                     indices.begin(),
                     leiden_key_dst_t<vertex_t>{});
-  keys.release();
+  keys.resize(0, stream);
+  keys.shrink_to_fit(stream);
 
   return leiden_csr<vertex_t, edge_t, weight_t>(
     handle,
@@ -390,7 +378,8 @@ leiden_result_t leiden_coo(raft::handle_t const& handle,
       ? std::make_optional(raft::device_span<weight_t const>(weights->data(), weights->size()))
       : std::nullopt,
     labels,
-    params);
+    params,
+    options);
 }
 
 }  // namespace detail

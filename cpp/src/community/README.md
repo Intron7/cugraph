@@ -81,8 +81,7 @@ Q(gamma) = sum_c [L_c / 2m - gamma (K_c / 2m)^2] with the Leiden algorithm:
 
  * V.A. Traag, L. Waltman, N.J. van Eck: From Louvain to Leiden: guaranteeing well-connected communities, Scientific Reports 9, 5233 (2019), https://doi.org/10.1038/s41598-019-41695-z
 
-The implementation is the native Leiden of rapids-singlecell (`rapids_singlecell.tl.leiden(flavor="rapids")`). For a graph
-built with `renumber = false` from the same CSR and the same 32-bit seed, both give bitwise identical results.
+The engine was originally written for rapids-singlecell, whose native Leiden runs the same algorithm.
 
  * **Iterations.** Each Leiden iteration (default 2, igraph semantics; -1 iterates until the partition is stable) runs, at
    every level of the hierarchy, a synchronous local-moving phase in hashed sub-rounds, a refinement that splits every
@@ -93,12 +92,17 @@ built with `renumber = false` from the same CSR and the same 32-bit seed, both g
    returned clustering. Labels are ordered by decreasing community size.
  * **Determinism.** Every decision is made in exact 64-bit fixed point (weights are quantized once), with total-order tie
    breaks and counter-based hashes of (seed, iteration, level, phase, sweep, vertex) instead of a random number
-   generator. Identical inputs, parameters and seed give bitwise identical results, independently of thread scheduling,
-   the GPU, the vertex / edge id types, the weight type (for equal values) and the number of GPUs.
+   generator; the remaining floating-point operations are explicitly rounded (`_rn` intrinsics, `--fmad=false`) and the
+   modularity is summed in a fixed order. Identical inputs, parameters and seed give bitwise identical results,
+   independently of thread scheduling, launch configuration, the vertex / edge id types, the weight type (for equal
+   values) and the number of GPUs. By construction this holds across GPU architectures; `LEIDEN_TEST.GoldenValues` pins
+   bitwise results and checks it on every architecture CI runs on.
  * **Edge semantics.** The graph must be symmetric (the data is checked). Weights must be finite and non-negative.
    Self-loops and zero-weight edges are ignored; parallel edges are summed (fp64, in ascending order of their weights).
- * **Memory.** One workspace allocation per call (about 3.5x the CSR, 2.9x with `low_memory`); nothing is allocated
-   inside the iterations.
+ * **Memory and launches.** One workspace allocation per call (about 2.7x the CSR with int32 ids and float weights);
+   nothing is allocated inside the iterations. Most kernels run as CUDA graphs (built once per call, replayed with
+   updated arguments; with CUDA >= 12.4 the local-moving sweeps run in a conditional WHILE node), and the stream is
+   synchronized a few times per level.
  * **Multi-GPU.** The current implementation all-gathers the edge list to every GPU and runs the single-GPU algorithm with
    the seed of rank 0 on every rank, so the result equals the single-GPU result on the same (internal) vertex ids for any
    number of GPUs. The graph must fit on one GPU.
@@ -110,10 +114,10 @@ Code layout:
  * `detail/leiden/`: the core, compiled once into `libcugraph_common` and shared by the single-GPU and multi-GPU
    libraries. `leiden_csr.hpp` declares `detail::leiden_csr` (raw CSR) and `detail::leiden_coo` (edge list in any
    order); `leiden_csr_impl.cuh` holds the input check, the canonicalization of parallel edges (`canonicalize.cuh`), the
-   workspace and the level-0 quantization; the type-independent engine (`numerics.cuh` fixed point and hashes,
-   `arena.cuh` workspace layout, `kernels_{ingest,move,refine,aggregate,final}.cuh`, `driver.cuh`) is compiled once in
-   `driver_common.cu` (interface: `driver.hpp`). The file names match the rapids-singlecell sources so that changes can
-   be diffed and merged in both directions.
+   workspace and the level-0 quantization (`kernels_ingest.cuh`); the type-independent engine (`numerics.cuh` fixed
+   point and hashes, `arena.cuh` workspace layout, `graph.cuh` CUDA graphs, `kernels_scan.cuh` graph-friendly scans,
+   `kernels_{move,refine,aggregate,final}.cuh`, `driver.cuh`) is compiled once in `driver_common.cu` (interface:
+   `driver.hpp`).
 
 The unit tests are the best place to look for examples: [SG](../../tests/community/leiden_test.cpp),
 [MG](../../tests/community/mg_leiden_test.cpp).

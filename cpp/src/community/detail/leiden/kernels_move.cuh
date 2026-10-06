@@ -4,77 +4,50 @@
  */
 #pragma once
 
-// LOCAL_MOVE + COMPACT (spec §4.6, §4.7, §7 M0-M5, V1).
-//
-//   M0  move_level_init      K_hat / csize recounted from P (warp-aggregated;
-//                            block-privatised for <= kMoveSmemIds ids, RE8)
-//   M1  move_bucket          active vertices of a sweep -> buckets [S][class]
-//                            (sweep 0 and TOP sweeps: every vertex)
-//   M2  move_eval_light      deg <= 32: warp per vertex, registers only
-//       move_eval_mid        deg <= 128: warp per vertex, 256-slot table
-//       move_eval_block      hub + xl: block per vertex, 2048-slot table in
-//                            hash-range passes (no global memory, §7)
-//   M3  move_apply           thread per mover: aggregated K_hat / csize
-//                            moves, P[v] <- c_v
-//       move_activate        warp per 32 movers (rows flattened):
-//                            activation against the post-sub-round state;
-//                            in-sweep bucket appends
-//   M5  move_compact         order-preserving relabel (= np.unique inverse)
-//   V1  move_project         P_l[v] <- P_{l+1}[cmap_l[v]]
-//
-// Determinism: every DECIDE is a function of exact integers read from the
-// frozen state of its sub-round, with a total-order argmax (score, -c);
-// apply is commutative integer addition (or a store into an empty community,
-// which only its mover can enter); activation runs after apply and reads the
-// post-sub-round state. Bucket, list and hash-slot orders are never read by a
-// decision. No kernel reads a workspace byte this LOCAL_MOVE has not written
-// (§6.5; see M0 for the arrays that need no initialisation).
-//
-// Driver interface: run_local_move<K>, run_compact and run_project on the
-// buffers of Layout::move (MoveBufs).
+// LOCAL_MOVE + COMPACT: M0 K_hat / csize, M1 active vertices into buckets
+// [sub-round][class], M2 DECIDE per degree class with fused activation, M3
+// apply, M5 order-preserving relabel, V1 projection. DECIDE takes a total-order
+// argmax (score, -c) over exact integers of its sub-round's frozen state, so
+// bucket, list and slot orders never reach a decision; no kernel reads a
+// workspace byte this LOCAL_MOVE has not written.
 
 #include "community/detail/leiden/arena.cuh"
-#include "community/detail/leiden/kernels_final.cuh"
+#include "community/detail/leiden/graph.cuh"
+#include "community/detail/leiden/kernels_scan.cuh"
 #include "community/detail/leiden/numerics.cuh"
 
 #include <cugraph/utilities/error.hpp>
 
 #include <raft/util/cuda_rt_essentials.hpp>
 
-#include <cub/device/device_scan.cuh>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/iterator/transform_iterator.h>
-
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <climits>
-#include <cmath>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
 #include <vector>
 
 namespace cugraph::detail::leiden_engine {
 
-// ---------------------------------------------------------------------------
-// Constants and small device helpers
-// ---------------------------------------------------------------------------
+constexpr int kMoveLightBlocksPerSm = 5;          // light kernel __launch_bounds__
+constexpr int kMoveMidSlots         = 256;        // per warp: 3 KB
+constexpr int kMoveMidBlock         = 128;        // mid kernel: 4-warp blocks (13 KB)
+constexpr int kMoveBlockSlots       = 2048;       // per block: 24 KB
+constexpr int kMoveXlCap            = 1536;       // distinct keys per pass (load 0.75)
+constexpr int kMoveSmemIds          = 4096;       // M0 block-privatised histogram
+constexpr i64 kNoScore              = LLONG_MIN;  // "no candidate" (scores > -2^63)
+constexpr int kDeferIdle            = -1;         // deferred-activation slot: unused
+constexpr int kDeferMulti           = -2;         //   two movers with different targets
+constexpr int kEmptySlot            = -1;         // free hash-table slot
 
-constexpr int kMoveLightMaxDeg = 32;         // light kernel: one entry per lane
-constexpr int kMoveMidMaxDeg   = 128;        // mid kernel: table load <= 0.5
-constexpr int kMoveMidSlots    = 256;        // per warp: 3 KB
-constexpr int kMoveMidBlock    = 128;        // mid kernel: 4-warp blocks (13 KB)
-constexpr int kMoveHubSlots    = 2048;       // per block: 24 KB
-constexpr int kMoveXlCap       = 1536;       // distinct keys per pass (load 0.75)
-constexpr int kMoveSmemIds     = 4096;       // M0 block-privatised histogram
-constexpr i64 kNoScore         = LLONG_MIN;  // "no candidate" (scores > -2^63)
-constexpr int kEmptySlot       = -1;         // free hash-table slot
-
-// Error bits of the move counter block (never set on valid input).
 enum : int { kMoveErrLabel = 1, kMoveErrBucket = 2 };
 
-// Sum of x over the lanes of match group m (every lane of m calls this with
-// the same m; groups execute independently).
+template <typename T>
+struct MoveWKindOf;
+template <WKind K>
+struct MoveWKindOf<EdgeW<K>> {
+  static constexpr WKind value = K;
+};
+
 __device__ __forceinline__ i64 move_group_sum(i64 x, unsigned m)
 {
   i64 s = 0;
@@ -83,15 +56,12 @@ __device__ __forceinline__ i64 move_group_sum(i64 x, unsigned m)
   return s;
 }
 
-// sub(v) of §4.4 (numerics.cuh sub_round) with a 32-bit modulo: the hashed
-// value is < 2^32, so the result is identical.
 __device__ __forceinline__ int move_sub_round(u64 ctx_move, int v, int S)
 {
   return static_cast<int>(static_cast<u32>(mix64(ctx_move ^ static_cast<u64>(v)) >> 32) %
                           static_cast<u32>(S));
 }
 
-// Total order of candidates: larger score, then smaller community id.
 __device__ __forceinline__ bool move_better(i64 g1, int c1, i64 g2, int c2)
 {
   return g1 > g2 || (g1 == g2 && c1 < c2);
@@ -110,8 +80,7 @@ __device__ __forceinline__ void move_warp_argmax(i64& g, int& c)
   }
 }
 
-// Table size for at most `keys` distinct keys at load <= 0.5 (>= 32: one slot
-// per lane in the scan), capped at `slots`.
+// Table size for <= `keys` distinct keys at load <= 0.5 (>= 32), capped.
 __device__ __forceinline__ int move_table_size(i64 keys, int slots)
 {
   if (keys <= 16) return 32;
@@ -119,17 +88,13 @@ __device__ __forceinline__ int move_table_size(i64 keys, int slots)
   return t < slots ? t : slots;
 }
 
-// Decision code written to dest's low word: the community id, plus
-// kMoveFreshBit when v moves into an empty community (own id or n + v). Only
-// v can enter that id in this sub-round and nobody leaves it, so M3a stores
-// K_hat / csize there instead of adding (the K_hat of an id that was never
-// used in this LOCAL_MOVE is not initialised, see M0).
+// DECIDE's code in dest's low word: the community, plus kMoveFreshBit for a
+// move into an empty one (v's id or n + v; M3 stores instead of adding).
 constexpr u32 kMoveFreshBit = 0x80000000u;
 constexpr u32 kMoveIdMask   = 0x7fffffffu;
 
-// DECIDE(v) of §4.6 from the row aggregates: own = W(v, d); (bg, bc) = best
-// (score, community) over c != d present in the row ((kNoScore, INT_MAX) if
-// none). csize is the frozen state (read only for the empty option).
+// DECIDE(v) from the row aggregates: own = W(v, d), (bg, bc) the best (score,
+// community) over c != d ((kNoScore, INT_MAX) if none).
 __device__ __forceinline__ u32 move_decide_final(int v,
                                                  int d,
                                                  i64 n,
@@ -162,21 +127,14 @@ __device__ __forceinline__ u32 move_decide_final(int v,
   return ((cc & kMoveIdMask) != static_cast<u32>(d) && cs > stay) ? cc : static_cast<u32>(d);
 }
 
-// ---------------------------------------------------------------------------
-// Buckets and counters
-// ---------------------------------------------------------------------------
-
-// Per-sweep vertex lists. Row r of `lists` ([S][n]) holds the bucket of
-// sub-round r, split into one segment per degree class: segment c starts at
-// off[c] and has capacity cap[c] = number of class-c vertices of the level
-// (a vertex enters at most one bucket per sweep, §4.6).
+// Sweep buckets: row r of `lists` ([S][n]) per sub-round, a segment per class.
 struct MoveBuckets {
   int* lists           = nullptr;
   int* counts          = nullptr;  // [S][kNumClasses]
   int* err             = nullptr;
   i64 n                = 0;
-  int off[kNumClasses] = {0, 0, 0, 0};
-  int cap[kNumClasses] = {0, 0, 0, 0};
+  int off[kNumClasses] = {};
+  int cap[kNumClasses] = {};
 
   __host__ __device__ int* list(int r, int c) const
   {
@@ -185,25 +143,18 @@ struct MoveBuckets {
   __host__ __device__ int* count(int r, int c) const { return counts + r * kNumClasses + c; }
 };
 
-// Counter block in MoveBufs::bucket_count (S * kNumClasses * 4 ints):
-//   [0, 4S)        bucket counts per (sub-round, class)
-//   [4S, 5S)       movers per sub-round of the current sweep
-//   [5S]           error bits (kMoveErr*)
-//   [5S+1, 5S+6)   reserved (class counts + label check of the rsc test hooks)
+// Bucket counts (cleared every sweep); movers and error bits are in Control.
 struct MoveCounters {
-  int* base = nullptr;
-  int S     = kNumSubrounds;
+  int* base    = nullptr;
+  Control* ctl = nullptr;
+  int S        = kNumSubrounds;
   int* buckets() const { return base; }
-  int* movers(int r) const { return base + S * kNumClasses + r; }
-  int* err() const { return base + S * (kNumClasses + 1); }
-  int* classes() const { return err() + 1; }
-  static std::size_t ints(int S) { return static_cast<std::size_t>(S) * (kNumClasses + 1) + 6; }
+  // movers of sub-round r of the k-th sweep of the current chunk
+  int* movers(int k, int r) const { return &ctl->sweep_movers[k][r]; }
+  int* err() const { return &ctl->move_err; }
 };
-static_assert(kNumClasses * 4 >= kNumClasses + 1 + 6,
-              "move counters must fit MoveBufs::bucket_count");
 
-// Warp-aggregated append of v to bucket `key` = r * kNumClasses + c (-1:
-// nothing). Every lane of the warp calls this.
+// Warp-aggregated append of v to bucket `key` = r * kNumClasses + c (-1: none).
 __device__ __forceinline__ void move_bucket_append(const MoveBuckets& B, int key, int v)
 {
   const unsigned m = __match_any_sync(kFullMask, key);
@@ -222,7 +173,6 @@ __device__ __forceinline__ void move_bucket_append(const MoveBuckets& B, int key
   }
 }
 
-// Warp-aggregated append of the lanes with `mv` to a list (all lanes call).
 __device__ __forceinline__ void move_list_append(int* list, int* count, bool mv, int v)
 {
   const unsigned m = __ballot_sync(kFullMask, mv);
@@ -235,20 +185,8 @@ __device__ __forceinline__ void move_list_append(int* list, int* count, bool mv,
   if (mv) list[base + __popc(m & ((1u << lane) - 1u))] = v;
 }
 
-// ---------------------------------------------------------------------------
-// M0: level_init
-// ---------------------------------------------------------------------------
-
-// K[c] = sum of k_hat over P[v] == c and csize[c] = |{v : P[v] == c}| for
-// c in [0, id_bound) (zeroed by the caller first); csize of every other id of
-// [0, 2n) is set to 0 here. K of those ids is not touched: it is read only
-// while the id is in use, and its first use in this LOCAL_MOVE is a move into
-// an empty community, which stores it (M3a). `dest` needs no initialisation
-// either (§6.5 holds: no stale byte is ever read): it is read only for
-// vertices evaluated in the same sub-round; the activity bitmaps are cleared
-// by M1 (see MoveFlags). kSmem: a block-privatised histogram over
-// id_bound <= kMoveSmemIds ids (few communities, e.g. V-cycle levels),
-// flushed with one atomic per used id.
+// M0: K[c] = sum of k_hat, csize[c] = |{v : P[v] == c}| for c < id_bound
+// (zeroed by the caller); resets the other csize and the deferred slots.
 template <bool kSmem>
 __global__ void __launch_bounds__(kBlock) move_level_init_kernel(const int* __restrict__ P,
                                                                  const i64* __restrict__ khat,
@@ -256,6 +194,7 @@ __global__ void __launch_bounds__(kBlock) move_level_init_kernel(const int* __re
                                                                  i64 id_bound,
                                                                  i64* __restrict__ Kc,
                                                                  int* __restrict__ csize,
+                                                                 int* __restrict__ defer_slot,
                                                                  int* __restrict__ err)
 {
   extern __shared__ __align__(16) unsigned char move_init_smem[];
@@ -286,6 +225,7 @@ __global__ void __launch_bounds__(kBlock) move_level_init_kernel(const int* __re
       }
       csize[n + v] = 0;
       if (v >= id_bound) csize[v] = 0;
+      defer_slot[v] = kDeferIdle;
     }
     const unsigned m = __match_any_sync(kFullMask, c);
     const i64 sum    = move_group_sum(k, m);
@@ -311,26 +251,14 @@ __global__ void __launch_bounds__(kBlock) move_level_init_kernel(const int* __re
   }
 }
 
-// ---------------------------------------------------------------------------
-// Activity flags (§4.6 `active`, as three bitmaps)
-// ---------------------------------------------------------------------------
-
-// The `active` flag of §4.6 is held as three bitmaps of one sweep, which
-// carry exactly the same information without any M2 write:
-//   A   active at the start of the sweep (= R of the previous sweep; sweep 0
-//       and TOP sweeps are all-active and do not read it);
-//   R   activated with sub(u) <= r in this sweep, i.e. after u's sub-round:
-//       active[u] at the end of the sweep is exactly R[u];
-//   Ap  appended in this sweep (activated with sub(u) > r).
-// During sub-round r, active[u] == 1 iff (sub(u) <= r ? R[u] : A[u] | Ap[u]):
-// M2 clears active[u] only at u's own sub-round, and before it only A or an
-// append can have set it, after it only an R activation. The bitmaps
-// (3 * ceil(n / 32) words) live in MoveBufs::rank, which COMPACT only uses
-// after LOCAL_MOVE; they stay cache-resident (62.5 KB per bitmap at 500k).
+// The `active` flag of a sweep as three bitmaps (in MoveBufs::rank): A (active
+// at the start = R of the previous sweep; null: all), R (activated after the
+// vertex's sub-round) and Ap (appended to a later sub-round of this sweep): in
+// sub-round r, active[u] iff (sub(u) <= r ? R[u] : A[u] | Ap[u]).
 struct MoveFlags {
-  const u32* A = nullptr;  // null: all-active sweep
-  u32* R       = nullptr;
-  u32* Ap      = nullptr;
+  u32* A  = nullptr;  // null: all-active sweep (completed by M1, see MoveAct)
+  u32* R  = nullptr;
+  u32* Ap = nullptr;
 };
 
 __device__ __forceinline__ bool move_bit(const u32* bm, int v)
@@ -338,22 +266,128 @@ __device__ __forceinline__ bool move_bit(const u32* bm, int v)
   return (bm[v >> 5] >> (v & 31)) & 1u;
 }
 
-// ---------------------------------------------------------------------------
-// M1: bucket_build
-// ---------------------------------------------------------------------------
+// Activation, fused into M2: when v (sub-round r) moves to cv, every counted
+// neighbour u with P_post[u] != cv becomes active: appended to its later
+// sub-round's bucket if sub(u) > r (once per sweep), else its R bit is set.
+// P_post[u] == P[u] unless sub(u) == r; then the target is deferred to the
+// next sweep's M1. Skipped in a phase's first and last sweep and in TOP sweeps.
+struct MoveState {
+  int k;          // current sweep, advanced by the last node of a sweep
+  int chunk0;     // first sweep of the launch chunk (sweep_movers row 0)
+  int chunk_end;  // the chunk's sweeps are [chunk0, chunk_end)
+  int pad;
+};
 
-// Buckets the vertices active at the start of the sweep (F.A == null: all)
-// and clears this sweep's R and Ap words (one word per 32 vertices).
-__global__ void __launch_bounds__(kBlock) move_bucket_kernel(const i64* __restrict__ indptr,
-                                                             i64 n,
-                                                             MoveFlags F,
-                                                             u64 ctx_move,
-                                                             int S,
-                                                             ClassThresholds th,
-                                                             MoveBuckets B)
+// A phase has ended once its chunk reaches the cap or holds a zero-move sweep;
+// a TOP phase's COMPACT runs behind this gate.
+struct MovePhaseGate {
+  const MoveState* st = nullptr;  // null: the phase has ended
+  int S               = 0;
+  int cap             = 0;
+};
+
+__device__ __forceinline__ bool move_phase_done(const MovePhaseGate& g, const Control* ctl)
 {
-  const int lane   = threadIdx.x & (kWarp - 1);
-  const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
+  if (!g.st || g.st->chunk_end >= g.cap) return true;
+  const int len = g.st->chunk_end - g.st->chunk0;
+  for (int j = 0; j < len; ++j) {
+    int moved = 0;
+    for (int r = 0; r < g.S; ++r)
+      moved |= ctl->sweep_movers[j][r];
+    if (!moved) return true;
+  }
+  return false;
+}
+
+// Phase-constant arguments of M1, M2 and M3 for sub-round r.
+struct MoveAct {
+  MoveBuckets B;
+  ClassThresholds th;
+  u32* bm0            = nullptr;  // activity bitmaps: R of sweep k is bm[k & 1], A
+  u32* bm1            = nullptr;  // of sweep k is R of sweep k - 1 (MoveFlags)
+  u32* ap             = nullptr;  // appended in the current sweep
+  int* slot           = nullptr;  // [n] deferred target per vertex
+  Control* ctl        = nullptr;
+  const MoveState* st = nullptr;
+  u64 s64             = 0;  // seed64
+  u32 it = 0, level = 0, phase = 0, sweep0 = 0;
+  int cap = 0;  // sweeps of the phase
+  int S   = kNumSubrounds;
+  int r   = 0;
+  int top = 0;  // TOP phase: every sweep all-active, no activation
+
+  __device__ __forceinline__ int sweep() const { return st->k; }
+  __device__ __forceinline__ bool do_low(int k) const { return !top && k + 1 < cap; }
+  __device__ __forceinline__ bool do_high(int k) const { return !top && k > 0; }
+  __device__ __forceinline__ bool on(int k) const { return do_low(k) || do_high(k); }
+  __device__ __forceinline__ MoveFlags flags(int k) const
+  {
+    MoveFlags F;
+    F.A  = (top || k == 0) ? nullptr : ((k & 1) ? bm0 : bm1);
+    F.R  = (k & 1) ? bm1 : bm0;
+    F.Ap = ap;
+    return F;
+  }
+  __device__ __forceinline__ u64 ctx_move(int k) const
+  {
+    return ctx(s64, kTagMove, it, level, phase, sweep0 + static_cast<u32>(k));
+  }
+  __device__ __forceinline__ u64 stamp_hi(int k) const
+  {
+    return static_cast<u64>(1u + static_cast<u32>(k) * S + r) << 32;
+  }
+  __device__ __forceinline__ int* mover_count(int k) const
+  {
+    return &ctl->sweep_movers[k - st->chunk0][r];
+  }
+};
+
+// Activation for the counted entry (u, c = frozen P[u]) of a mover with target
+// cv (u = -1: none); every lane of the warp calls it.
+__device__ __forceinline__ void move_activate_entry(
+  const MoveAct& t, int k, const i64* __restrict__ indptr, int u, int c, int cv)
+{
+  int key = -1;
+  if (u >= 0) {
+    const int su      = move_sub_round(t.ctx_move(k), u, t.S);
+    const MoveFlags F = t.flags(k);
+    u32* rw           = F.R + (u >> 5);
+    const u32 bit     = 1u << (u & 31);
+    if (su < t.r) {
+      if (t.do_low(k) && c != cv && !(*rw & bit)) atomicOr(rw, bit);
+    } else if (su > t.r) {
+      if (t.do_high(k) && c != cv && !((F.A[u >> 5] | F.Ap[u >> 5]) & bit) &&
+          !(atomicOr(&F.Ap[u >> 5], bit) & bit))
+        key = su * kNumClasses + degree_class(indptr[u + 1] - indptr[u], t.th);
+    } else if (t.do_low(k) && !(*rw & bit)) {
+      const int old = atomicCAS(&t.slot[u], kDeferIdle, cv);
+      if (old != kDeferIdle && old != cv && old != kDeferMulti) atomicExch(&t.slot[u], kDeferMulti);
+    }
+  }
+  move_bucket_append(t.B, key, u);
+}
+
+// M1: applies the deferred activations, buckets the active vertices (F.A null:
+// all) and clears R and Ap; a no-op after a zero-move sweep of the chunk.
+__global__ void __launch_bounds__(kBlock)
+  move_bucket_kernel(const i64* __restrict__ indptr, i64 n, MoveAct t, const int* __restrict__ P)
+{
+  const int k = t.sweep();
+  const int S = t.S;
+  if (k > t.st->chunk0) {
+    const int* prev = t.ctl->sweep_movers[k - 1 - t.st->chunk0];
+    int moved       = 0;
+    for (int r = 0; r < S; ++r)
+      moved |= prev[r];
+    if (!moved) return;
+  }
+  const MoveFlags F        = t.flags(k);
+  const u64 ctx_move       = t.ctx_move(k);
+  const ClassThresholds th = t.th;
+  const MoveBuckets& B     = t.B;
+  int* __restrict__ slot   = t.slot;
+  const int lane           = threadIdx.x & (kWarp - 1);
+  const i64 stride         = static_cast<i64>(gridDim.x) * blockDim.x;
   for (i64 base = static_cast<i64>(blockIdx.x) * blockDim.x + (threadIdx.x & ~(kWarp - 1));
        base < n;
        base += stride) {
@@ -362,23 +396,31 @@ __global__ void __launch_bounds__(kBlock) move_bucket_kernel(const i64* __restri
       F.R[base >> 5]  = 0;
       F.Ap[base >> 5] = 0;
     }
-    int key = -1;
+    int key  = -1;
+    bool act = false;
     if (v < n) {
-      if (!F.A || move_bit(F.A, static_cast<int>(v))) {
+      act = !F.A || move_bit(F.A, static_cast<int>(v));
+      if (F.A) {
+        const int sl = slot[v];
+        if (sl != kDeferIdle) {
+          slot[v] = kDeferIdle;
+          act     = act || sl == kDeferMulti || P[v] != sl;
+        }
+      }
+      if (act) {
         const int r = move_sub_round(ctx_move, static_cast<int>(v), S);
         const int c = degree_class(indptr[v + 1] - indptr[v], th);
         key         = r * kNumClasses + c;
       }
     }
+    if (F.A) {  // this warp owns word base / 32
+      const unsigned m = __ballot_sync(kFullMask, act);
+      if (lane == 0) F.A[base >> 5] = m;
+    }
     move_bucket_append(B, key, static_cast<int>(v));
   }
 }
 
-// ---------------------------------------------------------------------------
-// M2: DECIDE per degree class
-// ---------------------------------------------------------------------------
-
-// Frozen state of one sub-round plus the outputs of M2.
 template <WKind K>
 struct MoveEval {
   const i64* indptr;
@@ -390,37 +432,111 @@ struct MoveEval {
   const int* csize;
   i64* dest;
   int* movers;
-  int* mover_count;
   i64 n;
   double lam;
-  u64 stamp_hi;  // stamp(sweep, r) << 32
 };
 
-// Vertices per warp of a group prefetch: spread the list over every warp of
-// the grid first, then batch up to 32 (D's adaptive vpw; layout only).
+// Vertices per warp of a group prefetch (layout only).
 __device__ __forceinline__ int move_vpw(i64 cnt, i64 nwarps)
 {
-  const i64 v = cnt / nwarps;
+  const i64 rounds = (cnt + nwarps * kWarp - 1) / (nwarps * kWarp);
+  if (rounds < 1) return 1;
+  const i64 v = (cnt + nwarps * rounds - 1) / (nwarps * rounds);
   return v < 1 ? 1 : (v > kWarp ? kWarp : static_cast<int>(v));
 }
 
-// light (deg <= 32): warp per vertex, one entry per lane, match_any groups;
-// a group prefetch (lane i loads the scalars of the group's i-th vertex).
-// 6 resident blocks per SM (<= 40 registers) is 1.25x faster than the
-// unconstrained 54 registers at brain500k level 0 (the kernel is latency
-// bound on random gathers).
+// Exact pruning: v keeps d whenever stay = W(v, d) - pen_v(K_d - k_v) >= max(0,
+// W(v, V \ d)), since every c != d scores at most W(v, c) <= W(v, V \ d) and
+// DECIDE needs a strictly larger score (a shortcut where most vertices stay).
+__device__ __forceinline__ bool move_stays(i64 own, i64 oth, i64 Kd, i64 kv, Mult mu)
+{
+  const i64 stay = own - pen(Kd - kv, mu);
+  return stay >= 0 && stay >= oth;
+}
+
 template <WKind K>
-__global__ void __launch_bounds__(kBlock, 6) move_eval_light_kernel(MoveEval<K> a,
-                                                                    const int* __restrict__ list,
-                                                                    const int* __restrict__ count,
-                                                                    int cap)
+__device__ __forceinline__ void move_light_entry(
+  const MoveEval<K>& a, int v, i64 b, i64 e, int lane, int& u, int& c, i64& x)
+{
+  u           = -1;
+  c           = -1;
+  x           = 0;
+  const i64 j = b + lane;
+  if (j < e) {
+    const int y = __ldcs(&a.indices[j]);
+    if (y != v) {
+      const i64 q = a.w.cs(j);
+      if (q > 0) {
+        u = y;
+        c = a.P[y];
+        x = q;
+      }
+    }
+  }
+}
+
+// DECIDE of the vertex held by lane `src` (pk, pKd: its k_hat and K_d) from
+// every lane's row entry (c, x); lane src updates res.
+template <WKind K, bool kPrune>
+__device__ __forceinline__ void move_light_decide(const MoveEval<K>& a,
+                                                  i64* s_w,
+                                                  int lane,
+                                                  int src,
+                                                  int v,
+                                                  int d,
+                                                  int c,
+                                                  i64 x,
+                                                  Mult pm,
+                                                  i64 pk,
+                                                  i64 pKd,
+                                                  u32& res)
+{
+  Mult mu;
+  mu.M  = __shfl_sync(kFullMask, pm.M, src);
+  mu.sh = __shfl_sync(kFullMask, pm.sh, src);
+  if constexpr (kPrune) {
+    const i64 own = warp_sum(c == d ? x : 0ll);
+    const i64 oth = warp_sum(c != d ? x : 0ll);  // x = 0 if c < 0
+    bool stays    = false;
+    if (lane == src) stays = move_stays(own, oth, pKd, pk, mu);
+    if (__shfl_sync(kFullMask, stays, src)) return;  // res = d
+  }
+  const unsigned m = __match_any_sync(kFullMask, c);
+  s_w[lane]        = x;
+  __syncwarp();
+  i64 own = 0, bg = kNoScore;
+  int bc = INT_MAX;
+  if (c >= 0 && lane == __ffs(m) - 1) {
+    i64 sum = 0;
+    for (unsigned mm = m; mm; mm &= mm - 1)
+      sum += s_w[__ffs(mm) - 1];
+    if (c == d) {
+      own = sum;
+    } else {
+      bg = sum - pen(a.Kc[c], mu);
+      bc = c;
+    }
+  }
+  __syncwarp();
+  own = warp_sum(own);
+  move_warp_argmax(bg, bc);
+  if (lane == src) res = move_decide_final(v, d, a.n, own, pKd, pk, mu, bg, bc, a.csize);
+}
+
+// light: warp per vertex, one entry per lane, match_any groups and a group
+// prefetch; two vertices per step keep both rows' dependent loads in flight.
+template <WKind K, bool kPrune>
+__global__ void __launch_bounds__(kBlock, kMoveLightBlocksPerSm) move_eval_light_kernel(
+  MoveEval<K> a, const int* __restrict__ list, const int* __restrict__ count, int cap, MoveAct t)
 {
   __shared__ i64 s_w[kWarpsPerBlock][kWarp];
   const int lane = threadIdx.x & (kWarp - 1), wib = threadIdx.x / kWarp;
-  const i64 cnt = min(*count, cap);
-  const i64 nw  = static_cast<i64>(gridDim.x) * kWarpsPerBlock;
-  const i64 gw  = static_cast<i64>(blockIdx.x) * kWarpsPerBlock + wib;
-  const int vpw = move_vpw(cnt, nw);
+  const int k    = t.sweep();
+  const bool act = t.on(k);
+  const i64 cnt  = min(*count, cap);
+  const i64 nw   = static_cast<i64>(gridDim.x) * kWarpsPerBlock;
+  const i64 gw   = static_cast<i64>(blockIdx.x) * kWarpsPerBlock + wib;
+  const int vpw  = move_vpw(cnt, nw);
   for (i64 base = gw * vpw; base < cnt; base += nw * vpw) {
     int pv = -1, pd = 0;
     i64 pb = 0, pe = 0, pk = 0, pKd = 0;
@@ -436,93 +552,47 @@ __global__ void __launch_bounds__(kBlock, 6) move_eval_light_kernel(MoveEval<K> 
     }
     u32 res       = static_cast<u32>(pd);
     unsigned todo = __ballot_sync(kFullMask, pv >= 0);
-    while (todo) {
-      const int src = __ffs(todo) - 1;
+    while (todo) {  // two vertices per step (warp-uniform)
+      const int s1 = __ffs(todo) - 1;
       todo &= todo - 1;
-      const int v = __shfl_sync(kFullMask, pv, src);
-      const i64 b = __shfl_sync(kFullMask, pb, src);
-      const i64 e = __shfl_sync(kFullMask, pe, src);
-      const int d = __shfl_sync(kFullMask, pd, src);
-      Mult mu;
-      mu.M        = __shfl_sync(kFullMask, pm.M, src);
-      mu.sh       = __shfl_sync(kFullMask, pm.sh, src);
-      int c       = -1;
-      i64 x       = 0;
-      const i64 j = b + lane;
-      if (j < e) {
-        const int u = a.indices[j];
-        if (u != v) {
-          const i64 q = a.w(j);
-          if (q > 0) {
-            c = a.P[u];
-            x = q;
-          }
+      const int s2 = todo ? __ffs(todo) - 1 : -1;
+      if (s2 >= 0) todo &= todo - 1;
+      const int t2 = s2 >= 0 ? s2 : s1;
+      const int v1 = __shfl_sync(kFullMask, pv, s1);
+      const i64 b1 = __shfl_sync(kFullMask, pb, s1);
+      const i64 e1 = __shfl_sync(kFullMask, pe, s1);
+      const int d1 = __shfl_sync(kFullMask, pd, s1);
+      const int v2 = __shfl_sync(kFullMask, pv, t2);
+      const i64 b2 = __shfl_sync(kFullMask, pb, t2);
+      const i64 e2 = s2 >= 0 ? __shfl_sync(kFullMask, pe, t2) : b2;
+      const int d2 = __shfl_sync(kFullMask, pd, t2);
+      int u1, u2, c1, c2;
+      i64 x1, x2;
+      move_light_entry(a, v1, b1, e1, lane, u1, c1, x1);
+      move_light_entry(a, v2, b2, e2, lane, u2, c2, x2);
+      move_light_decide<K, kPrune>(a, s_w[wib], lane, s1, v1, d1, c1, x1, pm, pk, pKd, res);
+      if (s2 >= 0)
+        move_light_decide<K, kPrune>(a, s_w[wib], lane, s2, v2, d2, c2, x2, pm, pk, pKd, res);
+      if (act) {  // activation by the movers (rows in registers)
+        const u32 r1 = __shfl_sync(kFullMask, res, s1);
+        if (r1 != static_cast<u32>(d1))  // warp-uniform
+          move_activate_entry(t, k, a.indptr, u1, c1, static_cast<int>(r1 & kMoveIdMask));
+        if (s2 >= 0) {
+          const u32 r2 = __shfl_sync(kFullMask, res, s2);
+          if (r2 != static_cast<u32>(d2))
+            move_activate_entry(t, k, a.indptr, u2, c2, static_cast<int>(r2 & kMoveIdMask));
         }
       }
-      const unsigned m = __match_any_sync(kFullMask, c);
-      s_w[wib][lane]   = x;
-      __syncwarp();
-      i64 own = 0, bg = kNoScore;
-      int bc = INT_MAX;
-      if (c >= 0 && lane == __ffs(m) - 1) {
-        i64 sum = 0;
-        for (unsigned mm = m; mm; mm &= mm - 1)
-          sum += s_w[wib][__ffs(mm) - 1];
-        if (c == d) {
-          own = sum;
-        } else {
-          bg = sum - pen(a.Kc[c], mu);
-          bc = c;
-        }
-      }
-      __syncwarp();
-      own = warp_sum(own);
-      move_warp_argmax(bg, bc);
-      if (lane == src) res = move_decide_final(v, d, a.n, own, pKd, pk, mu, bg, bc, a.csize);
     }
-    if (pv >= 0) { a.dest[pv] = a.stamp_hi | static_cast<u64>(res); }
-    move_list_append(a.movers, a.mover_count, pv >= 0 && res != static_cast<u32>(pd), pv);
+    if (pv >= 0) { a.dest[pv] = t.stamp_hi(k) | static_cast<u64>(res); }
+    move_list_append(a.movers, t.mover_count(k), pv >= 0 && res != static_cast<u32>(pd), pv);
   }
 }
 
-// Hash tables (mid: one per warp; hub / xl: one per block) hold int32 keys
-// (the community id; kEmptySlot when free) and int64 values. They are
-// initialised at kernel start, and the reader of a vertex's table returns
-// every used slot to (kEmptySlot, 0) after use, so every vertex starts on an
-// empty table (§6.5). 12 bytes per slot instead of a 16-byte stamped key keeps
-// more warps resident.
-
-// Insert a pre-aggregated sum into a warp's table: one leader per distinct c
-// per 32-entry chunk, so no two lanes hold the same key concurrently; the
-// claimer sets the value (stale values are never read).
-__device__ __forceinline__ void move_warp_table_add(int* keys, i64* vals, u32 mask, int c, i64 sum)
-{
-  volatile int* vk = keys;
-  u32 h            = fmix32(static_cast<u32>(c)) & mask;
-  while (true) {
-    const int cur = vk[h];
-    if (cur == c) {
-      vals[h] += sum;
-      return;
-    }
-    if (cur == kEmptySlot) {
-      if (atomicCAS(&keys[h], kEmptySlot, c) == kEmptySlot) {
-        vals[h] = sum;
-        return;
-      }
-      continue;  // claimed meanwhile: re-read slot h
-    }
-    h = (h + 1) & mask;
-  }
-}
-
-// mid (deg <= 128): warp per vertex with a 256-slot table per warp (D's
-// ev2_mid128 with 4-warp blocks, its faster variant).
-template <WKind K>
-__global__ void __launch_bounds__(kMoveMidBlock) move_eval_mid_kernel(MoveEval<K> a,
-                                                                      const int* __restrict__ list,
-                                                                      const int* __restrict__ count,
-                                                                      int cap)
+// mid: warp per vertex, 256-slot table per warp.
+template <WKind K, bool kPrune>
+__global__ void __launch_bounds__(kMoveMidBlock, 7) move_eval_mid_kernel(
+  MoveEval<K> a, const int* __restrict__ list, const int* __restrict__ count, int cap, MoveAct t)
 {
   constexpr int kWarps = kMoveMidBlock / kWarp;
   __shared__ int s_key[kWarps][kMoveMidSlots];
@@ -536,10 +606,12 @@ __global__ void __launch_bounds__(kMoveMidBlock) move_eval_mid_kernel(MoveEval<K
     vals[s] = 0;
   }
   __syncwarp();
-  const i64 cnt = min(*count, cap);
-  const i64 nw  = static_cast<i64>(gridDim.x) * kWarps;
-  const i64 gw  = static_cast<i64>(blockIdx.x) * kWarps + wib;
-  const int vpw = move_vpw(cnt, nw);
+  const int k    = t.sweep();
+  const bool act = t.on(k);
+  const i64 cnt  = min(*count, cap);
+  const i64 nw   = static_cast<i64>(gridDim.x) * kWarps;
+  const i64 gw   = static_cast<i64>(blockIdx.x) * kWarps + wib;
+  const int vpw  = move_vpw(cnt, nw);
   for (i64 base = gw * vpw; base < cnt; base += nw * vpw) {
     int pv = -1, pd = 0;
     i64 pb = 0, pe = 0, pk = 0, pKd = 0;
@@ -563,8 +635,26 @@ __global__ void __launch_bounds__(kMoveMidBlock) move_eval_mid_kernel(MoveEval<K
       const i64 e = __shfl_sync(kFullMask, pe, src);
       const int d = __shfl_sync(kFullMask, pd, src);
       Mult mu;
-      mu.M            = __shfl_sync(kFullMask, pm.M, src);
-      mu.sh           = __shfl_sync(kFullMask, pm.sh, src);
+      mu.M  = __shfl_sync(kFullMask, pm.M, src);
+      mu.sh = __shfl_sync(kFullMask, pm.sh, src);
+      if constexpr (kPrune) {  // first pass: own / oth only
+        i64 own = 0, oth = 0;
+        for (i64 j = b + lane; j < e; j += kWarp) {
+          const int u = __ldcs(&a.indices[j]);
+          if (u == v) continue;
+          const i64 q = a.w.cs(j);
+          if (q <= 0) continue;
+          if (a.P[u] == d)
+            own += q;
+          else
+            oth += q;
+        }
+        own        = warp_sum(own);
+        oth        = warp_sum(oth);
+        bool stays = false;
+        if (lane == src) stays = move_stays(own, oth, pKd, pk, mu);
+        if (__shfl_sync(kFullMask, stays, src)) continue;  // res = d
+      }
       const int tsize = move_table_size(e - b, kMoveMidSlots);
       const u32 mask  = static_cast<u32>(tsize - 1);
       for (i64 j0 = b; j0 < e; j0 += kWarp) {
@@ -572,9 +662,9 @@ __global__ void __launch_bounds__(kMoveMidBlock) move_eval_mid_kernel(MoveEval<K
         int c       = -1;
         i64 x       = 0;
         if (j < e) {
-          const int u = a.indices[j];
+          const int u = __ldcs(&a.indices[j]);
           if (u != v) {
-            const i64 q = a.w(j);
+            const i64 q = a.w.cs(j);
             if (q > 0) {
               c = a.P[u];
               x = q;
@@ -588,7 +678,7 @@ __global__ void __launch_bounds__(kMoveMidBlock) move_eval_mid_kernel(MoveEval<K
           i64 sum = 0;
           for (unsigned mm = m; mm; mm &= mm - 1)
             sum += s_w[wib][__ffs(mm) - 1];
-          move_warp_table_add(keys, vals, mask, c, sum);
+          warp_table_add(keys, vals, mask, c, sum);
         }
         __syncwarp();
       }
@@ -613,17 +703,33 @@ __global__ void __launch_bounds__(kMoveMidBlock) move_eval_mid_kernel(MoveEval<K
       move_warp_argmax(bg, bc);
       if (lane == src) res = move_decide_final(v, d, a.n, own, pKd, pk, mu, bg, bc, a.csize);
       __syncwarp();  // the scan finishes before the next claims
+      if (act) {     // activation by a mover (its row is cached)
+        const u32 rv = __shfl_sync(kFullMask, res, src);
+        if (rv != static_cast<u32>(d)) {  // warp-uniform
+          const int cv = static_cast<int>(rv & kMoveIdMask);
+          for (i64 j0 = b; j0 < e; j0 += kWarp) {
+            const i64 j = j0 + lane;
+            int u = -1, c = -1;
+            if (j < e) {
+              const int y = a.indices[j];
+              if (y != v && a.w(j) > 0) {
+                u = y;
+                c = a.P[y];
+              }
+            }
+            move_activate_entry(t, k, a.indptr, u, c, cv);
+          }
+        }
+      }
     }
-    if (pv >= 0) { a.dest[pv] = a.stamp_hi | static_cast<u64>(res); }
-    move_list_append(a.movers, a.mover_count, pv >= 0 && res != static_cast<u32>(pd), pv);
+    if (pv >= 0) { a.dest[pv] = t.stamp_hi(k) | static_cast<u64>(res); }
+    move_list_append(a.movers, t.mover_count(k), pv >= 0 && res != static_cast<u32>(pd), pv);
   }
 }
 
-// Insert into the block table (warp leaders, pre-aggregated per 32-entry
-// chunk; several warps may hold the same key). Values are 0 on an empty slot,
-// so every inserter adds. Returns false if the pass must be split: more than
-// `cap` distinct keys were claimed, or no free slot was found within one
-// sweep of the table.
+// Insert into the block table (several warps may hold a key; values start at
+// 0, inserters add). Claims, then counts, so a key racing with its own claim
+// never splits a pass. False if the pass must split (> cap keys or no slot).
 __device__ __forceinline__ bool move_block_table_add(
   int* keys, i64* vals, u32 mask, int c, i64 sum, int* claimed, int cap)
 {
@@ -649,62 +755,87 @@ __device__ __forceinline__ bool move_block_table_add(
   return false;
 }
 
-// Hash-range pass of community c among npass passes (fmix32 is a bijection,
-// so doubling npass always terminates; passes nest: pass p of npass splits
-// into 2p, 2p + 1 of 2 npass).
-__device__ __forceinline__ u64 move_pass_of(int c, u64 npass)
+// block: block per vertex, shared-memory table in hash-range passes; npass
+// starts at ceil(deg / pass_cap) and doubles when a pass overflows. The argmax
+// and W(v, d) carry across passes, so npass never changes the result.
+template <WKind K, bool kPrune>
+__global__ void __launch_bounds__(kBlock, 3) move_eval_block_kernel(MoveEval<K> a,
+                                                                    const int* __restrict__ list,
+                                                                    const int* __restrict__ count,
+                                                                    int cap,
+                                                                    int pass_cap,
+                                                                    MoveAct t)
 {
-  return (static_cast<u64>(fmix32(static_cast<u32>(c))) * npass) >> 32;
-}
-
-// hub (deg <= 1024) and xl (> 1024): block per vertex with the 2048-slot
-// table in shared memory (no global memory, §7). Each vertex runs hash-range
-// passes: npass starts at ceil(deg / pass_cap) and doubles whenever a pass
-// claims more than pass_cap distinct keys (the aborted pass's slots are
-// re-initialised and the vertex resumes at pass 2p); the running argmax over
-// (score, -c) and W(v, d) are carried across passes, so the result does not
-// depend on npass. Hub vertices (deg <= 1024 < pass_cap) take one pass.
-template <WKind K>
-__global__ void __launch_bounds__(kBlock) move_eval_block_kernel(MoveEval<K> a,
-                                                                 const int* __restrict__ list_hub,
-                                                                 const int* __restrict__ count_hub,
-                                                                 int cap_hub,
-                                                                 const int* __restrict__ list_xl,
-                                                                 const int* __restrict__ count_xl,
-                                                                 int cap_xl,
-                                                                 int pass_cap)
-{
-  __shared__ int s_key[kMoveHubSlots];
-  __shared__ i64 s_val[kMoveHubSlots];
+  __shared__ int s_key[kMoveBlockSlots];
+  __shared__ i64 s_val[kMoveBlockSlots];
   __shared__ i64 s_w[kWarpsPerBlock][kWarp];
   __shared__ i64 s_g[kWarpsPerBlock];
   __shared__ int s_c[kWarpsPerBlock];
   __shared__ i64 s_own;
   __shared__ int s_claimed;
   __shared__ int s_ovf;
+  __shared__ u32 s_res;
   const int tid  = threadIdx.x;
   const int lane = tid & (kWarp - 1), wib = tid / kWarp;
-  for (int s = tid; s < kMoveHubSlots; s += blockDim.x) {
+  for (int s = tid; s < kMoveBlockSlots; s += blockDim.x) {
     s_key[s] = kEmptySlot;
     s_val[s] = 0;
   }
-  const i64 n1 = min(*count_hub, cap_hub);
-  const i64 n2 = min(*count_xl, cap_xl);
+  const i64 cnt  = min(*count, cap);
+  const int k    = t.sweep();
+  const bool act = t.on(k);
   __syncthreads();
-  for (i64 i = blockIdx.x; i < n1 + n2; i += gridDim.x) {
-    const int v = i < n1 ? list_hub[i] : list_xl[i - n1];
+  for (i64 i = blockIdx.x; i < cnt; i += gridDim.x) {
+    const int v = list[i];
     const i64 b = a.indptr[v], e = a.indptr[v + 1];
     const int d   = a.P[v];
     const i64 kv  = a.khat[v];
     const Mult mu = make_mult(kv, a.lam);
     const i64 deg = e - b;
     const int tsize =
-      move_table_size(deg < pass_cap ? deg : static_cast<i64>(pass_cap), kMoveHubSlots);
+      move_table_size(deg < pass_cap ? deg : static_cast<i64>(pass_cap), kMoveBlockSlots);
     const u32 mask = static_cast<u32>(tsize - 1);
     u64 npass      = deg > pass_cap ? static_cast<u64>((deg + pass_cap - 1) / pass_cap) : 1ull;
-    u64 p          = 0;
-    i64 rg         = kNoScore;  // running argmax (thread 0)
-    int rc         = INT_MAX;
+    if constexpr (kPrune) {  // first pass: own / oth only
+      i64 own = 0, oth = 0;
+      for (i64 j = b + tid; j < e; j += blockDim.x) {
+        const int u = __ldcs(&a.indices[j]);
+        if (u == v) continue;
+        const i64 q = a.w.cs(j);
+        if (q <= 0) continue;
+        if (a.P[u] == d)
+          own += q;
+        else
+          oth += q;
+      }
+      own = warp_sum(own);
+      oth = warp_sum(oth);
+      if (lane == 0) {
+        s_g[wib]    = own;
+        s_w[wib][0] = oth;
+      }
+      __syncthreads();
+      bool stays = false;
+      if (tid == 0) {
+        i64 o = 0, t = 0;
+        for (int q = 0; q < kWarpsPerBlock; ++q) {
+          o += s_g[q];
+          t += s_w[q][0];
+        }
+        stays = move_stays(o, t, a.Kc[d], kv, mu);
+        s_ovf = stays ? 1 : 0;
+      }
+      __syncthreads();
+      const bool skip = s_ovf != 0;
+      __syncthreads();  // every thread has read s_ovf
+      if (skip) {
+        if (tid == 0) a.dest[v] = t.stamp_hi(k) | static_cast<u64>(d);
+        continue;
+      }
+    }
+    u64 p  = 0;
+    i64 rg = kNoScore;  // running argmax (thread 0)
+    int rc = INT_MAX;
     if (tid == 0) s_own = 0;
     while (p < npass) {
       if (tid == 0) {
@@ -717,12 +848,12 @@ __global__ void __launch_bounds__(kBlock) move_eval_block_kernel(MoveEval<K> a,
         int c       = -1;
         i64 x       = 0;
         if (j < e) {
-          const int u = a.indices[j];
+          const int u = __ldcs(&a.indices[j]);
           if (u != v) {
-            const i64 q = a.w(j);
+            const i64 q = a.w.cs(j);
             if (q > 0) {
               const int cu = a.P[u];
-              if (npass == 1 || move_pass_of(cu, npass) == p) {
+              if (npass == 1 || table_pass(cu, npass) == p) {
                 c = cu;
                 x = q;
               }
@@ -744,8 +875,7 @@ __global__ void __launch_bounds__(kBlock) move_eval_block_kernel(MoveEval<K> a,
       __syncthreads();
       const bool ovf = s_ovf != 0;
       __syncthreads();  // every thread has read s_ovf
-      if (ovf) {        // split the pass: clear its slots, resume at 2p of 2
-                        // npass
+      if (ovf) {        // split: clear the pass, resume at 2p of 2 npass
         for (int s = tid; s < tsize; s += blockDim.x) {
           s_key[s] = kEmptySlot;
           s_val[s] = 0;
@@ -792,34 +922,46 @@ __global__ void __launch_bounds__(kBlock) move_eval_block_kernel(MoveEval<K> a,
     }
     if (tid == 0) {
       const u32 res = move_decide_final(v, d, a.n, s_own, a.Kc[d], kv, mu, rg, rc, a.csize);
-      a.dest[v]     = a.stamp_hi | static_cast<u64>(res);
-      if (res != static_cast<u32>(d)) a.movers[atomicAdd(a.mover_count, 1)] = v;
+      a.dest[v]     = t.stamp_hi(k) | static_cast<u64>(res);
+      if (res != static_cast<u32>(d)) a.movers[atomicAdd(t.mover_count(k), 1)] = v;
+      s_res = res;
     }
-    __syncthreads();  // s_own
+    __syncthreads();
+    const u32 rv = s_res;
+    if (act && rv != static_cast<u32>(d)) {  // activation (block-wide)
+      const int cv = static_cast<int>(rv & kMoveIdMask);
+      for (i64 j0 = b + static_cast<i64>(wib) * kWarp; j0 < e; j0 += blockDim.x) {
+        const i64 j = j0 + lane;
+        int u = -1, c = -1;
+        if (j < e) {
+          const int y = a.indices[j];
+          if (y != v && a.w(j) > 0) {
+            u = y;
+            c = a.P[y];
+          }
+        }
+        move_activate_entry(t, k, a.indptr, u, c, cv);
+      }
+    }
+    __syncthreads();  // s_own, s_res
   }
 }
 
-// ---------------------------------------------------------------------------
-// M3: apply, then activate
-// ---------------------------------------------------------------------------
-
-// M3a, thread per mover: K_hat / csize moves aggregated per source and per
-// destination community (match_any + one atomic per group; exact and
-// order-free); a move into an empty community (kMoveFreshBit) stores
-// K_hat[c] = k_hat_v and csize[c] = 1 (v is its only entrant, nobody leaves
-// it); P[v] <- c_v.
+// M3, thread per mover: K_hat / csize moves aggregated per source and target
+// (match_any); a move into an empty community stores (k_v, 1). P[v] <- c_v.
 __global__ void __launch_bounds__(kBlock) move_apply_kernel(const i64* __restrict__ khat,
                                                             int* __restrict__ P,
                                                             i64* __restrict__ Kc,
                                                             int* __restrict__ csize,
                                                             const i64* __restrict__ dest,
                                                             const int* __restrict__ movers,
-                                                            const int* __restrict__ mover_count,
+                                                            MoveAct t,
                                                             int mover_cap)
 {
-  const int lane   = threadIdx.x & (kWarp - 1);
-  const i64 cnt    = min(*mover_count, mover_cap);
-  const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
+  const int* __restrict__ mover_count = t.mover_count(t.sweep());
+  const int lane                      = threadIdx.x & (kWarp - 1);
+  const i64 cnt                       = min(*mover_count, mover_cap);
+  const i64 stride                    = static_cast<i64>(gridDim.x) * blockDim.x;
   for (i64 base = static_cast<i64>(blockIdx.x) * blockDim.x + (threadIdx.x & ~(kWarp - 1));
        base < cnt;
        base += stride) {
@@ -860,126 +1002,78 @@ __global__ void __launch_bounds__(kBlock) move_apply_kernel(const i64* __restric
   }
 }
 
-// M3b, warp per 32 movers, after M3a (P is the post-sub-round state): for
-// every counted (v, u) of a mover v with P[u] != P[v] and u inactive, u is
-// activated; if sub(u) > r it is appended to bucket [sub(u)][class(u)] (the
-// atomicOr on Ap admits one append per vertex and sweep) and evaluated later
-// in this sweep (§4.6; flags as in MoveFlags). Shortcuts that change no
-// result:
-//   - do_high = false: every vertex was active at the start of the sweep
-//     (sweep 0), so a u with sub(u) > r is still unevaluated, hence active;
-//   - do_low = false: in the last sweep of the phase, activations with
-//     sub(u) <= r (which only feed the next sweep) are unobservable;
-//   - an activation flag that is already set is stable within the kernel,
-//     so it is tested before the P[u] load.
-// (TOP sweeps skip M3b: every TOP sweep restarts all-active.) A warp takes up
-// to 32 movers (adaptive, as move_vpw) and processes their rows flattened
-// (lane f of a chunk takes the f-th entry of the concatenated rows), so no
-// lane idles on short rows.
-template <WKind K>
-__global__ void __launch_bounds__(kBlock) move_activate_kernel(const i64* __restrict__ indptr,
-                                                               const int* __restrict__ indices,
-                                                               EdgeW<K> w,
-                                                               const int* __restrict__ P,
-                                                               MoveFlags F,
-                                                               const int* __restrict__ movers,
-                                                               const int* __restrict__ mover_count,
-                                                               int mover_cap,
-                                                               int r,
-                                                               u64 ctx_move,
-                                                               int S,
-                                                               bool do_low,
-                                                               bool do_high,
-                                                               ClassThresholds th,
-                                                               MoveBuckets B)
-{
-  const int lane = threadIdx.x & (kWarp - 1);
-  const i64 cnt  = min(*mover_count, mover_cap);
-  const i64 nw   = static_cast<i64>(gridDim.x) * kWarpsPerBlock;
-  const i64 gw   = static_cast<i64>(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarp;
-  // movers per warp: few movers (coarse levels, late sweeps) are spread
-  // over every warp first, their long rows would serialise otherwise
-  const int mpw = move_vpw(cnt, nw);
-  for (i64 base = gw * mpw; base < cnt; base += nw * mpw) {
-    const i64 i = base + lane;
-    int v = -1, c = -1;
-    i64 rb = 0, deg = 0;
-    if (lane < mpw && i < cnt) {
-      v   = movers[i];
-      c   = P[v];
-      rb  = indptr[v];
-      deg = indptr[v + 1] - rb;
-    }
-    // inclusive scan of the row lengths over the warp
-    i64 off = deg;
-#pragma unroll
-    for (int o = 1; o < kWarp; o <<= 1) {
-      const i64 y = __shfl_up_sync(kFullMask, off, o);
-      if (lane >= o) off += y;
-    }
-    const i64 total = __shfl_sync(kFullMask, off, kWarp - 1);
-    for (i64 f0 = 0; f0 < total; f0 += kWarp) {
-      const i64 f = f0 + lane;
-      // owner: the first lane whose inclusive offset exceeds f
-      int pos = 0;
-#pragma unroll
-      for (int bstep = kWarp / 2; bstep >= 1; bstep >>= 1) {
-        const i64 o = __shfl_sync(kFullMask, off, pos + bstep - 1);
-        if (o <= f) pos += bstep;
-      }
-      const i64 o_end = __shfl_sync(kFullMask, off, pos);
-      const i64 o_deg = __shfl_sync(kFullMask, deg, pos);
-      const i64 o_b   = __shfl_sync(kFullMask, rb, pos);
-      const int x     = __shfl_sync(kFullMask, v, pos);
-      const int cx    = __shfl_sync(kFullMask, c, pos);
-      int key = -1, u = 0;
-      if (f < total) {
-        const i64 j = o_b + (f - (o_end - o_deg));
-        u           = indices[j];
-        if (u != x) {
-          const int su  = move_sub_round(ctx_move, u, S);
-          const u32 bit = 1u << (u & 31);
-          if (su <= r) {
-            if (do_low && !(F.R[u >> 5] & bit) && w(j) > 0 && P[u] != cx)
-              atomicOr(&F.R[u >> 5], bit);
-          } else if (do_high && !((F.A[u >> 5] | F.Ap[u >> 5]) & bit) && w(j) > 0 && P[u] != cx &&
-                     !(atomicOr(&F.Ap[u >> 5], bit) & bit)) {
-            key = su * kNumClasses + degree_class(indptr[u + 1] - indptr[u], th);
-          }
-        }
-      }
-      move_bucket_append(B, key, u);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// M5: COMPACT (order-preserving relabel, §4.7) and V1: project
-// ---------------------------------------------------------------------------
-
-struct MoveUsedFlag {
-  const int* csize;
-  i64 n2;
-  __host__ __device__ int operator()(i64 i) const { return (i < n2 && csize[i] > 0) ? 1 : 0; }
-};
-
-// rank = exclusive_scan(csize > 0) over [0, 2n] (rank[2n] = C); P[v] <-
-// rank[P[v]]; KS[rank[c]] <- K[c] for every used c.
+// M5: P[v] <- rank[P[v]], rank = exclusive_scan(csize > 0) over [0, 2n],
+// KS[rank[c]] <- K[c], move_C <- C; behind a closed gate only move_C <- -1.
 __global__ void move_compact_kernel(const int* __restrict__ rank,
                                     const int* __restrict__ csize,
                                     const i64* __restrict__ Kc,
                                     i64 n,
                                     int* __restrict__ P,
-                                    i64* __restrict__ KS)
+                                    i64* __restrict__ KS,
+                                    Control* ctl,
+                                    MovePhaseGate gate)
 {
+  if (gate.st) {  // uniform over the grid
+    __shared__ int done;
+    if (threadIdx.x == 0) done = move_phase_done(gate, ctl);
+    __syncthreads();
+    if (!done) {
+      if (blockIdx.x == 0 && threadIdx.x == 0) ctl->move_C = -1;
+      return;
+    }
+  }
   const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
   for (i64 i = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x; i < 2 * n; i += stride) {
     if (csize[i] > 0) KS[rank[i]] = Kc[i];
     if (i < n) P[i] = rank[P[i]];
   }
+  if (blockIdx.x == 0 && threadIdx.x == 0) ctl->move_C = rank[2 * n];
 }
 
-// V1: P_fine[v] = P_coarse[cmap[v]].
+__global__ void move_clear_kernel(int* __restrict__ p, int count)
+{
+  for (int i = threadIdx.x; i < count; i += blockDim.x)
+    p[i] = 0;
+}
+
+// Starts a launch chunk of sweeps [k0, k_end): sweep counter, cleared movers.
+__global__ void move_chunk_kernel(MoveState* __restrict__ st,
+                                  int k0,
+                                  int k_end,
+                                  Control* __restrict__ ctl)
+{
+  if (threadIdx.x == 0) {
+    st->k         = k0;
+    st->chunk0    = k0;
+    st->chunk_end = k_end;
+  }
+  for (int i = threadIdx.x; i < kSweepChunk * kMaxSubrounds; i += blockDim.x)
+    (&ctl->sweep_movers[0][0])[i] = 0;
+}
+
+__global__ void move_sweep_end_kernel(MoveState* __restrict__ st)
+{
+  if (threadIdx.x == 0) st->k += 1;
+}
+
+#if LEIDEN_GRAPH_LOOP
+// Sweep end in a WHILE node: loop while the sweep moved and the chunk has more.
+__global__ void move_sweep_end_loop_kernel(MoveState* __restrict__ st,
+                                           const Control* __restrict__ ctl,
+                                           int S,
+                                           cudaGraphConditionalHandle h)
+{
+  if (threadIdx.x != 0) return;
+  const int k    = st->k;
+  const int* row = ctl->sweep_movers[k - st->chunk0];
+  int moved      = 0;
+  for (int r = 0; r < S; ++r)
+    moved |= row[r];
+  st->k = k + 1;
+  cudaGraphSetConditional(h, (moved && k + 1 < st->chunk_end) ? 1u : 0u);
+}
+#endif
+
 __global__ void move_project_kernel(const int* __restrict__ Pc,
                                     const int* __restrict__ cmap,
                                     i64 n_fine,
@@ -990,60 +1084,79 @@ __global__ void move_project_kernel(const int* __restrict__ Pc,
     Pf[v] = Pc[cmap[v]];
 }
 
-// ---------------------------------------------------------------------------
-// Host side
-// ---------------------------------------------------------------------------
-
 struct MoveParams {
   double lam = 0.0;  // lam_hat = gamma / 2m_hat (one host division)
   u32 seed   = 0;
   u32 it     = 0;
   u32 level  = 0;
   u32 phase  = kPhaseDown;
-  u32 sweep0 = 0;  // TOP: TOP sweeps already run at this level (§4.4)
+  u32 sweep0 = 0;  // TOP: TOP sweeps already run at this level
   int cap    = 4;  // DOWN / UP 4, TOP 32
   int S      = kNumSubrounds;
   ClassThresholds th{};
   int xl_cap   = kMoveXlCap;  // distinct keys per hash-range pass
   i64 id_bound = -1;          // P ids in [0, id_bound) on entry; -1: n
+  // sweeps of the first chunk (replayed TOP phases: 1, they mostly certify)
+  int first_chunk = kSweepChunk;
+  bool defer_rest = false;  // TOP: continue_local_move launches the rest
 };
 
 struct MoveStats {
   i64 moves  = 0;
   int sweeps = 0;
-  i64 last   = 0;                 // movers of the last executed sweep
-  std::vector<i64> per_sweep;     // [cap]
-  std::vector<i64> per_subround;  // [cap * S]
+  i64 last   = 0;  // movers of the last executed sweep
 };
 
-// Small D2H readback (a sync point): through the caller's pinned buffer when
-// given, else pageable memory (correct, only slower).
-inline void move_readback(
-  void* host, const void* dev, std::size_t bytes, void* pinned, cudaStream_t s)
+// A launched LOCAL_MOVE; the last chunk's movers arrive with the caller's next
+// readback (finish_local_move). A deferred phase launched only its first chunk.
+struct MoveRun {
+  MoveStats st;
+  int S            = kNumSubrounds;
+  int len          = 0;        // sweeps of the pending chunk (0: nothing pending)
+  bool stopped     = false;    // a sweep moved nothing (later sweeps are no-ops)
+  int next         = 0;        // first sweep not launched yet
+  int cap          = 0;        // sweeps of the phase
+  MoveState* state = nullptr;  // the device sweep state of the phase
+
+  bool more_sweeps() const { return !stopped && next < cap; }
+  // the gate for this phase's COMPACT while sweeps may remain unlaunched
+  MovePhaseGate gate() const
+  {
+    return more_sweeps() ? MovePhaseGate{state, S, cap} : MovePhaseGate{};
+  }
+};
+
+struct MoveLaunch {
+  GraphChain* graph = nullptr;
+  bool loop         = false;      // sweeps of a chunk in one WHILE graph launch
+  std::vector<KernelCall> calls;  // the sweep's calls
+  GraphDeps deps;                 // their graph dependencies
+};
+
+// Folds the pending chunk's movers (from a readback) into the statistics.
+inline void move_fold_chunk(MoveRun& mr, const Control& h)
 {
-  void* dst = pinned ? pinned : host;
-  RAFT_CUDA_TRY(cudaMemcpyAsync(dst, dev, bytes, cudaMemcpyDeviceToHost, s));
-  RAFT_CUDA_TRY(cudaStreamSynchronize(s));
-  if (pinned) std::memcpy(host, pinned, bytes);
+  CUGRAPH_EXPECTS(!(h.move_err & kMoveErrLabel),
+                  "leiden: internal error: local move community ids out of range.");
+  CUGRAPH_EXPECTS(!(h.move_err & kMoveErrBucket),
+                  "leiden: internal error: local move bucket overflow.");
+  for (int k = 0; k < mr.len && !mr.stopped; ++k) {
+    i64 moves = 0;
+    for (int r = 0; r < mr.S; ++r)
+      moves += h.sweep_movers[k][r];
+    mr.st.moves += moves;
+    mr.st.last = moves;
+    ++mr.st.sweeps;
+    if (moves == 0) mr.stopped = true;  // converged (TOP: certified)
+  }
+  mr.len = 0;
 }
 
-inline void move_check_params(const MoveParams& p)
+inline void finish_local_move(MoveRun& mr, const Control& h)
 {
-  CUGRAPH_EXPECTS(p.S >= 1 && p.S <= 64, "leiden: subrounds must be in [1, 64].");
-  CUGRAPH_EXPECTS(p.cap >= 0 && p.cap <= (1 << 24), "leiden: sweep cap must be in [0, 2^24].");
-  CUGRAPH_EXPECTS(static_cast<u64>(p.sweep0) + static_cast<u64>(p.cap) <= (1ull << 24),
-                  "leiden: sweep0 + cap must be <= 2^24.");
-  CUGRAPH_EXPECTS(p.it < (1u << 16) && p.level < 256u && p.phase <= kPhaseTop,
-                  "leiden: iteration, level or phase out of range.");
-  CUGRAPH_EXPECTS(p.lam >= 0.0 && std::isfinite(p.lam), "leiden: lambda must be finite and >= 0.");
-  CUGRAPH_EXPECTS(p.th.light >= 0 && p.th.light <= kMoveLightMaxDeg && p.th.mid >= p.th.light &&
-                    p.th.mid <= kMoveMidMaxDeg && p.th.hub >= p.th.mid,
-                  "leiden: class thresholds need 0 <= light <= 32, "
-                  "light <= mid <= 128, hub >= mid.");
-  CUGRAPH_EXPECTS(p.xl_cap >= 1 && p.xl_cap <= kMoveXlCap, "leiden: xl_cap must be in [1, 1536].");
+  if (mr.len > 0) move_fold_chunk(mr, h);
 }
 
-// M0: K_hat and csize of the level.
 inline void run_level_init(
   const int* P, const i64* khat, i64 n, i64 id_bound, const MoveBufs& mb, int* err, cudaStream_t s)
 {
@@ -1052,19 +1165,20 @@ inline void run_level_init(
   const unsigned g = grid_items(n);
   if (id_bound <= kMoveSmemIds) {
     const std::size_t smem = static_cast<std::size_t>(id_bound) * (sizeof(i64) + sizeof(int));
-    move_level_init_kernel<true><<<g, kBlock, smem, s>>>(P, khat, n, id_bound, mb.K, mb.csize, err);
+    move_level_init_kernel<true>
+      <<<g, kBlock, smem, s>>>(P, khat, n, id_bound, mb.K, mb.csize, mb.defer_slot, err);
   } else {
-    move_level_init_kernel<false><<<g, kBlock, 0, s>>>(P, khat, n, id_bound, mb.K, mb.csize, err);
+    move_level_init_kernel<false>
+      <<<g, kBlock, 0, s>>>(P, khat, n, id_bound, mb.K, mb.csize, mb.defer_slot, err);
   }
   RAFT_CHECK_CUDA(s);
 }
 
 inline MoveBuckets move_buckets(const MoveBufs& mb,
-                                int S,
+                                const MoveCounters& ctr,
                                 i64 n,
                                 const i64 (&class_count)[kNumClasses])
 {
-  const MoveCounters ctr{mb.bucket_count, S};
   MoveBuckets B;
   B.lists  = mb.buckets;
   B.counts = ctr.buckets();
@@ -1076,185 +1190,281 @@ inline MoveBuckets move_buckets(const MoveBufs& mb,
     B.cap[c] = static_cast<int>(class_count[c]);
     off += class_count[c];
   }
-  CUGRAPH_EXPECTS(off == n, "leiden: class counts must sum to n.");
+  CUGRAPH_EXPECTS(off == n, "leiden: internal error: degree class counts must sum to n.");
   return B;
 }
 
-// M2 for sub-round r: one kernel per class present at the level (the bucket
-// lists and counts are device-resident, so an empty bucket costs at most a
-// no-op launch).
-template <WKind K>
-void run_move_eval(const MoveEval<K>& a,
-                   const MoveBuckets& B,
-                   int r,
-                   const i64 (&cc)[kNumClasses],
-                   int xl_cap,
-                   cudaStream_t s)
+// M2 calls for sub-round r, one per class (absent classes disabled).
+template <WKind K, bool kPrune>
+void move_eval_calls_t(KernelCall* c,
+                       const MoveEval<K>& a,
+                       const MoveBuckets& B,
+                       int r,
+                       const i64 (&cc)[kNumClasses],
+                       int xl_cap,
+                       const MoveAct& t)
 {
-  if (cc[kClassLight] > 0) {
-    move_eval_light_kernel<K><<<grid_for(cc[kClassLight], kWarpsPerBlock), kBlock, 0, s>>>(
-      a, B.list(r, kClassLight), B.count(r, kClassLight), B.cap[kClassLight]);
-    RAFT_CHECK_CUDA(s);
-  }
-  if (cc[kClassMid] > 0) {
-    move_eval_mid_kernel<K>
-      <<<grid_for(cc[kClassMid], kMoveMidBlock / kWarp, kMoveMidBlock), kMoveMidBlock, 0, s>>>(
-        a, B.list(r, kClassMid), B.count(r, kClassMid), B.cap[kClassMid]);
-    RAFT_CHECK_CUDA(s);
-  }
-  const i64 nb = cc[kClassHub] + cc[kClassXl];
-  if (nb > 0) {
-    move_eval_block_kernel<K><<<grid_for(nb, 1), kBlock, 0, s>>>(a,
-                                                                 B.list(r, kClassHub),
-                                                                 B.count(r, kClassHub),
-                                                                 B.cap[kClassHub],
-                                                                 B.list(r, kClassXl),
-                                                                 B.count(r, kClassXl),
-                                                                 B.cap[kClassXl],
-                                                                 xl_cap);
-    RAFT_CHECK_CUDA(s);
+  c[0].set(cc[kClassLight] > 0,
+           move_eval_light_kernel<K, kPrune>,
+           dim3(grid_resident(cc[kClassLight], kWarpsPerBlock, kMoveLightBlocksPerSm)),
+           dim3(kBlock),
+           0,
+           a,
+           B.list(r, kClassLight),
+           B.count(r, kClassLight),
+           B.cap[kClassLight],
+           t);
+  c[1].set(cc[kClassMid] > 0,
+           move_eval_mid_kernel<K, kPrune>,
+           dim3(grid_occ(
+             move_eval_mid_kernel<K, kPrune>, cc[kClassMid], kMoveMidBlock / kWarp, kMoveMidBlock)),
+           dim3(kMoveMidBlock),
+           0,
+           a,
+           B.list(r, kClassMid),
+           B.count(r, kClassMid),
+           B.cap[kClassMid],
+           t);
+  c[2].set(cc[kClassBlock] > 0,
+           move_eval_block_kernel<K, kPrune>,
+           dim3(grid_occ(move_eval_block_kernel<K, kPrune>, cc[kClassBlock], 1)),
+           dim3(kBlock),
+           0,
+           a,
+           B.list(r, kClassBlock),
+           B.count(r, kClassBlock),
+           B.cap[kClassBlock],
+           xl_cap,
+           t);
+}
+
+template <WKind K>
+void move_eval_calls(KernelCall* c,
+                     const MoveEval<K>& a,
+                     const MoveBuckets& B,
+                     int r,
+                     const i64 (&cc)[kNumClasses],
+                     int xl_cap,
+                     bool prune,
+                     const MoveAct& t = MoveAct{})
+{
+  if (prune) {
+    move_eval_calls_t<K, true>(c, a, B, r, cc, xl_cap, t);
+  } else {
+    move_eval_calls_t<K, false>(c, a, B, r, cc, xl_cap, t);
   }
 }
 
-// LOCAL_MOVE(G, k_hat, P, cap, phase) of §4.6 on a level of n vertices with
-// P ids in [0, id_bound) on entry; afterwards P holds ids in [0, 2n) (not
-// compacted: run_compact does that). class_count: vertices per degree class
-// of this level with the thresholds prm.th (S2 / SL2).
-// One readback (SW) per sweep.
-template <WKind K>
-MoveStats run_local_move(const i64* indptr,
-                         const int* indices,
-                         EdgeW<K> w,
-                         const i64* khat,
-                         int* P,
-                         i64 n,
-                         const i64 (&class_count)[kNumClasses],
-                         const MoveParams& prm,
-                         const MoveBufs& mb,
-                         void* pinned,
-                         cudaStream_t s)
-{
-  move_check_params(prm);
-  const int S = prm.S;
-  MoveStats st;
-  st.per_sweep.assign(prm.cap, 0);
-  st.per_subround.assign(static_cast<std::size_t>(prm.cap) * S, 0);
-  if (n == 0) {  // every sweep is empty: the first one ends the phase
-    st.sweeps = prm.cap > 0 ? 1 : 0;
-    return st;
-  }
-  const i64 id_bound = prm.id_bound < 0 ? n : prm.id_bound;
-  CUGRAPH_EXPECTS(id_bound >= 1 && id_bound <= n, "leiden: id_bound must be in [1, n].");
-  const MoveCounters ctr{mb.bucket_count, S};
-  const MoveBuckets B = move_buckets(mb, S, n, class_count);
-  RAFT_CUDA_TRY(cudaMemsetAsync(ctr.base, 0, MoveCounters::ints(S) * sizeof(int), s));
-  run_level_init(P, khat, n, id_bound, mb, ctr.err(), s);  // M0
+// Pruning pays off where most vertices stay: not in the first iteration's DOWN.
+inline bool move_prune(const MoveParams& p) { return p.phase != kPhaseDown || p.it > 0; }
 
-  const u64 s64           = seed64(prm.seed);
-  const unsigned g_items  = grid_items(n);
-  const unsigned g_movers = grid_for(n, kBlock);
-  MoveEval<K> a{
-    indptr, indices, w, khat, P, mb.K, mb.csize, mb.dest, mb.movers, nullptr, n, prm.lam, 0ull};
-  // activity bitmaps (MoveFlags) in the rank buffer: R of sweep s is
-  // bm[s % 2], A of sweep s is R of sweep s - 1
-  const i64 words = (n + 31) / 32;
-  u32* bm[2]      = {reinterpret_cast<u32*>(mb.rank), reinterpret_cast<u32*>(mb.rank) + words};
-  u32* ap         = reinterpret_cast<u32*>(mb.rank) + 2 * words;
-  std::vector<int> h(S + 1);
-  for (int sweep = 0; sweep < prm.cap; ++sweep) {
-    const u64 cm =
-      ctx(s64, kTagMove, prm.it, prm.level, prm.phase, prm.sweep0 + static_cast<u32>(sweep));
-    RAFT_CUDA_TRY(cudaMemsetAsync(
-      ctr.base, 0, static_cast<std::size_t>(S) * (kNumClasses + 1) * sizeof(int), s));
-    // M3b work that can be observed (see move_activate_kernel): TOP
-    // sweeps restart all-active; sweep 0 starts all-active (M0); the last
-    // sweep feeds no next sweep.
-    const bool top     = prm.phase == kPhaseTop;
-    const bool do_low  = !top && sweep + 1 < prm.cap;
-    const bool do_high = !top && sweep > 0;
-    // sweep 0 and every TOP sweep are all-active (no A)
-    MoveFlags F;
-    F.A  = (top || sweep == 0) ? nullptr : bm[(sweep + 1) % 2];
-    F.R  = bm[sweep % 2];
-    F.Ap = ap;
-    move_bucket_kernel<<<g_items, kBlock, 0, s>>>(indptr, n, F, cm, S, prm.th, B);
+// Calls per sweep: clear, M1, per sub-round the three M2 classes (independent
+// branches: disjoint vertices) and M3, the sweep end.
+constexpr int kSweepHead     = 2;
+constexpr int kSweepPerRound = 4;
+inline int move_sweep_calls(int S) { return kSweepHead + kSweepPerRound * S + 1; }
+
+inline GraphDeps move_sweep_deps(int S)
+{
+  GraphDeps d(static_cast<std::size_t>(move_sweep_calls(S)));
+  d[1].assign(1, 0);
+  int prev = 1;
+  for (int r = 0; r < S; ++r) {
+    const int b = kSweepHead + kSweepPerRound * r;
+    for (int i = 0; i < 3; ++i)
+      d[b + i].assign(1, prev);
+    d[b + 3] = {b, b + 1, b + 2};
+    prev     = b + 3;
+  }
+  d[kSweepHead + kSweepPerRound * S].assign(1, prev);  // the sweep end
+  return d;
+}
+
+// Launches sweep chunks from mr.next: `first` sweeps now, each later chunk
+// (with `rest`) after a readback, until a chunk holds a zero-move sweep.
+inline void move_launch_chunks(
+  MoveRun& mr, MoveLaunch& ml, int first, bool rest, Control* ctl, void* pinned, cudaStream_t s)
+{
+  const KernelCall* c = ml.calls.data();
+  const int ncalls    = static_cast<int>(ml.calls.size());
+  const bool loop     = ml.graph && ml.loop;
+  for (bool lead = true; mr.next < mr.cap; lead = false) {
+    if (!lead) {  // long phases (TOP): one readback between chunks
+      if (!rest) return;
+      const Control h = read_control(ctl, s, pinned);
+      move_fold_chunk(mr, h);
+      if (mr.stopped) return;
+    }
+    const int c0  = mr.next;
+    const int len = std::min(lead ? first : kSweepChunk, mr.cap - c0);
+    move_chunk_kernel<<<1, kBlock, 0, s>>>(mr.state, c0, c0 + len, ctl);
     RAFT_CHECK_CUDA(s);
-    for (int r = 0; r < S; ++r) {
-      const u32 stamp = 1u + static_cast<u32>(sweep) * S + r;
-      a.stamp_hi      = static_cast<u64>(stamp) << 32;
-      a.mover_count   = ctr.movers(r);
-      run_move_eval<K>(a, B, r, class_count, prm.xl_cap, s);
-      move_apply_kernel<<<g_items, kBlock, 0, s>>>(
-        khat, P, mb.K, mb.csize, mb.dest, mb.movers, ctr.movers(r), static_cast<int>(n));
-      RAFT_CHECK_CUDA(s);
-      if (do_low || do_high) {
-        move_activate_kernel<K><<<g_movers, kBlock, 0, s>>>(indptr,
-                                                            indices,
-                                                            w,
-                                                            P,
-                                                            F,
-                                                            mb.movers,
-                                                            ctr.movers(r),
-                                                            static_cast<int>(n),
-                                                            r,
-                                                            cm,
-                                                            S,
-                                                            do_low,
-                                                            do_high,
-                                                            prm.th,
-                                                            B);
-        RAFT_CHECK_CUDA(s);
+    if (loop) {
+      ml.graph->launch(c, ncalls, ml.deps, s, true);
+    } else {
+      for (int k = 0; k < len; ++k) {
+        if (ml.graph) {
+          ml.graph->launch(c, ncalls, ml.deps, s);
+        } else {
+          launch_calls(c, ncalls, s);
+        }
       }
     }
-    // SW: movers per sub-round of this sweep + the error bits
-    move_readback(h.data(), ctr.movers(0), (S + 1) * sizeof(int), pinned, s);
-    CUGRAPH_EXPECTS(!(h[S] & kMoveErrLabel),
-                    "leiden: local move: community ids must "
-                    "lie in [0, id_bound).");
-    CUGRAPH_EXPECTS(!(h[S] & kMoveErrBucket), "leiden: local move: bucket overflow.");
-    i64 moves = 0;
-    for (int r = 0; r < S; ++r) {
-      st.per_subround[static_cast<std::size_t>(sweep) * S + r] = h[r];
-      moves += h[r];
-    }
-    st.per_sweep[sweep] = moves;
-    st.moves += moves;
-    st.last = moves;
-    ++st.sweeps;
-    if (moves == 0) break;  // DOWN / UP: converged; TOP: certified
+    mr.len  = len;
+    mr.next = c0 + len;
   }
-  return st;
 }
 
-// COMPACT (§4.7) after LOCAL_MOVE: P <- rank of its id among the used ids of
-// [0, 2n) (csize > 0), KS[rank[c]] <- K[c]; returns C (sync SL1).
-inline i64 run_compact(int* P,
+// LOCAL_MOVE of a level (launch only), P ids in [0, id_bound) -> [0, 2n).
+template <WKind K>
+MoveRun run_local_move(const i64* indptr,
+                       const int* indices,
+                       EdgeW<K> w,
+                       const i64* khat,
+                       int* P,
                        i64 n,
+                       const i64 (&class_count)[kNumClasses],
+                       const MoveParams& prm,
                        const MoveBufs& mb,
-                       i64* KS,
-                       void* cub,
-                       std::size_t cub_bytes,
+                       Control* ctl,
+                       MoveLaunch& ml,
                        void* pinned,
                        cudaStream_t s)
 {
-  if (n == 0) return 0;
-  const i64 n2 = 2 * n;
-  auto flags =
-    thrust::make_transform_iterator(thrust::counting_iterator<i64>(0), MoveUsedFlag{mb.csize, n2});
-  const int items  = cub_items(n2 + 1, "compact scan");
-  std::size_t need = 0;
-  RAFT_CUDA_TRY(cub::DeviceScan::ExclusiveSum(nullptr, need, flags, mb.rank, items, s));
-  CUGRAPH_EXPECTS(need <= cub_bytes, "leiden: CUB temp storage too small (compact).");
-  std::size_t tb = cub_bytes;
-  RAFT_CUDA_TRY(cub::DeviceScan::ExclusiveSum(cub, tb, flags, mb.rank, items, s));
-  move_compact_kernel<<<grid_items(n2), kBlock, 0, s>>>(mb.rank, mb.csize, mb.K, n, P, KS);
-  RAFT_CHECK_CUDA(s);
-  int C = 0;
-  move_readback(&C, mb.rank + n2, sizeof(int), pinned, s);
-  return C;
+  const int S = prm.S;
+  MoveRun mr;
+  mr.S    = S;
+  mr.next = mr.cap = prm.cap;  // set again below when sweeps launch
+  if (n == 0) {                // every sweep is empty: the first one ends the phase
+    mr.st.sweeps = prm.cap > 0 ? 1 : 0;
+    mr.stopped   = true;
+    return mr;
+  }
+  const i64 id_bound = prm.id_bound < 0 ? n : prm.id_bound;
+  CUGRAPH_EXPECTS(id_bound >= 1 && id_bound <= n, "leiden: internal error: id_bound out of range.");
+  const MoveCounters ctr{mb.bucket_count, ctl, S};
+  const MoveBuckets B = move_buckets(mb, ctr, n, class_count);
+  RAFT_CUDA_TRY(cudaMemsetAsync(ctr.err(), 0, sizeof(int), s));
+  run_level_init(P, khat, n, id_bound, mb, ctr.err(), s);  // M0
+
+  const unsigned g_items = grid_items(n);
+  MoveEval<K> a{indptr, indices, w, khat, P, mb.K, mb.csize, mb.dest, mb.movers, n, prm.lam};
+  // activity bitmaps in the rank buffer: R(s) = bm[s % 2], A(s) = R(s - 1)
+  const i64 words = (n + 31) / 32;
+  MoveState* st   = reinterpret_cast<MoveState*>(mb.desc);
+  MoveAct t;
+  t.B              = B;
+  t.th             = prm.th;
+  t.bm0            = reinterpret_cast<u32*>(mb.rank);
+  t.bm1            = reinterpret_cast<u32*>(mb.rank) + words;
+  t.ap             = reinterpret_cast<u32*>(mb.rank) + 2 * words;
+  t.slot           = mb.defer_slot;
+  t.ctl            = ctl;
+  t.st             = st;
+  t.s64            = seed64(prm.seed);
+  t.it             = prm.it;
+  t.level          = prm.level;
+  t.phase          = prm.phase;
+  t.sweep0         = prm.sweep0;
+  t.cap            = prm.cap;
+  t.S              = S;
+  t.top            = prm.phase == kPhaseTop ? 1 : 0;
+  const bool prune = move_prune(prm);
+  const int ncalls = move_sweep_calls(S);
+  ml.calls.resize(static_cast<std::size_t>(ncalls));
+  KernelCall* c = ml.calls.data();
+  c[0].set(true, move_clear_kernel, dim3(1), dim3(kBlock), 0, ctr.buckets(), S * kNumClasses);
+  c[1].set(true, move_bucket_kernel, dim3(g_items), dim3(kBlock), 0, indptr, n, t, P);
+  for (int r = 0; r < S; ++r) {
+    KernelCall* cr = c + kSweepHead + kSweepPerRound * r;
+    t.r            = r;
+    move_eval_calls<K>(cr, a, B, r, class_count, prm.xl_cap, prune, t);
+    cr[3].set(true,
+              move_apply_kernel,
+              dim3(g_items),
+              dim3(kBlock),
+              0,
+              khat,
+              P,
+              mb.K,
+              mb.csize,
+              mb.dest,
+              mb.movers,
+              t,
+              static_cast<int>(n));
+  }
+#if LEIDEN_GRAPH_LOOP
+  if (ml.graph && ml.loop)
+    c[ncalls - 1].set(true,
+                      move_sweep_end_loop_kernel,
+                      dim3(1),
+                      dim3(kWarp),
+                      0,
+                      st,
+                      ctl,
+                      S,
+                      cudaGraphConditionalHandle{0});
+  else
+#endif
+    c[ncalls - 1].set(true, move_sweep_end_kernel, dim3(1), dim3(kWarp), 0, st);
+  if (ml.graph && ml.deps.size() != static_cast<std::size_t>(ncalls)) ml.deps = move_sweep_deps(S);
+  mr.state        = st;
+  mr.next         = 0;
+  const int first = std::max(1, std::min(prm.first_chunk, static_cast<int>(kSweepChunk)));
+  move_launch_chunks(mr, ml, first, !prm.defer_rest, ctl, pinned, s);
+  return mr;
 }
 
-// V1: P_fine[v] <- P_coarse[cmap[v]] (V-cycle projection / flatten).
+// The rest of a deferred LOCAL_MOVE after the caller's readback.
+inline void continue_local_move(
+  MoveRun& mr, MoveLaunch& ml, Control* ctl, void* pinned, cudaStream_t s)
+{
+  CUGRAPH_EXPECTS(mr.len == 0, "leiden: internal error: move chunk not read back.");
+  if (!mr.more_sweeps()) return;
+  move_launch_chunks(mr, ml, kSweepChunk, true, ctl, pinned, s);
+}
+
+// COMPACT after LOCAL_MOVE (launch only); `gate`: the phase's MoveRun::gate().
+inline void launch_compact(int* P,
+                           i64 n,
+                           const MoveBufs& mb,
+                           i64* KS,
+                           void* cub,
+                           std::size_t cub_bytes,
+                           Control* ctl,
+                           cudaStream_t s,
+                           std::vector<KernelCall>* defer = nullptr,
+                           MovePhaseGate gate             = {})
+{
+  if (n == 0) {
+    RAFT_CUDA_TRY(cudaMemsetAsync(&ctl->move_C, 0, sizeof(i64), s));
+    return;
+  }
+  const i64 n2 = 2 * n;
+  // graph-friendly scan; the driver runs it in PLEIDEN_R's graph (`defer`)
+  std::vector<KernelCall> c(4);
+  scan_calls(c.data(), ScanUsed{mb.csize, n2}, mb.rank, n2 + 1, cub, cub_bytes);
+  c[3].set(true,
+           move_compact_kernel,
+           dim3(grid_items(n2)),
+           dim3(kBlock),
+           0,
+           mb.rank,
+           mb.csize,
+           mb.K,
+           n,
+           P,
+           KS,
+           ctl,
+           gate);
+  if (defer) {
+    defer->insert(defer->end(), c.begin(), c.end());
+  } else {
+    launch_calls(c.data(), 4, s);
+  }
+}
+
+// V1: P_fine[v] <- P_coarse[cmap[v]].
 inline void run_project(
   const int* P_coarse, const int* cmap, i64 n_fine, int* P_fine, cudaStream_t s)
 {

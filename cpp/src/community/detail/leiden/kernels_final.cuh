@@ -4,22 +4,9 @@
  */
 #pragma once
 
-// Finalize (spec §4.12, §4.13, §7 F1-F5).
-//
-//   F1  cc_hook       ECL-CC-style hooking over intra-community counted
-//                     edges (roots hooked under smaller roots with atomicCAS;
-//                     a warp "star hook" per 32 entries avoids contention)
-//   F2  cc_flatten    full compression (root = minimum vertex id of the
-//       + COMPACT     component), then order-preserving compaction
-//   F3  quality_rows  exact L_hat (per replica, block-reduced) and K_hat
-//                     (warp-aggregated int64 atomics)
-//   F4  quality_tree  t_c grid-wide, then the TREE1024 fixed-order fp64 sum
-//                     and Q (one 1024-thread block per replica)
-//   F5  label_keys    size-descending labels, ties by minimum vertex id
-//       + radix sort  (C keys) + label_gather (optionally through a vertex
-//                     permutation; unused, the input order is kept)
-//
-// Every runner initialises every accumulator it reads (§6.5).
+// Finalize: F1 cc_hook (ECL-CC hooking of intra-community counted edges), F2
+// cc_flatten (root = component minimum, then COMPACT), F3 quality_rows (exact
+// L_hat, K_hat), F4 quality_tree (TREE1024 sum and Q), F5 size-ordered labels.
 
 #include "community/detail/leiden/arena.cuh"
 #include "community/detail/leiden/numerics.cuh"
@@ -33,18 +20,13 @@
 #include <cuda_runtime.h>
 
 #include <climits>
-#include <cstddef>
-#include <cstdint>
+#include <utility>
 
 namespace cugraph::detail::leiden_engine {
 
-// ---------------------------------------------------------------------------
-// F1 / F2: connected-components split (ECL-CC; Jaiganesh & Burtscher 2018)
-// ---------------------------------------------------------------------------
-
-// Every pointer satisfies parent[x] <= x, so chains strictly decrease and end
-// at a root (parent[r] == r). Concurrent shortcuts only ever store another
-// ancestor, so the races are benign (volatile: no stale register copies).
+// CC split (ECL-CC, Jaiganesh & Burtscher 2018). parent[x] <= x always, so
+// chains decrease to a root; concurrent shortcuts only store another ancestor
+// (benign races; volatile reads).
 __device__ __forceinline__ int cc_find(int x, volatile int* parent)
 {
   int curr = parent[x];
@@ -91,16 +73,9 @@ __global__ void cc_init_kernel(i64 n, int* __restrict__ parent)
     parent[v] = static_cast<int>(v);
 }
 
-// Warp per row; every undirected counted edge {v, u} with P[u] == P[v] is
-// hooked once, from the row of its larger endpoint (the internal graphs are
-// symmetric in their counted entries, which ingest guarantees). Per chunk of
-// 32 entries, a "star hook" avoids lanes contending for v's root: every lane
-// finds its neighbour's representative, the warp takes the minimum mn over
-// them and v's representative, and each distinct representative r != mn is
-// hooked under mn by one CAS (expecting r to still be a root). mn and r lie in
-// v's component and mn < r, so the forest stays valid (parent[x] <= x) and
-// the final roots are the component minima as with plain hooking; a failed
-// CAS falls back to the standard union.
+// Warp per row: every counted intra-community edge is hooked once, from its
+// larger endpoint. Per 32-entry chunk the minimum mn of the representatives
+// takes every other one r by CAS (mn < r keeps parent[x] <= x), else union.
 template <WKind K>
 __global__ void cc_hook_kernel(const i64* __restrict__ indptr,
                                const int* __restrict__ indices,
@@ -120,8 +95,8 @@ __global__ void cc_hook_kernel(const i64* __restrict__ indptr,
       const i64 j = j0 + lane;
       int u       = -1;
       if (j < e) {
-        const int x = indices[j];
-        if (x < v && P[x] == pv && w(j) > 0) u = x;
+        const int x = __ldcs(&indices[j]);
+        if (x < v && P[x] == pv && w.cs(j) > 0) u = x;
       }
       const unsigned any = __ballot_sync(kFullMask, u >= 0);
       if (!any) continue;  // warp-uniform
@@ -142,8 +117,7 @@ __global__ void cc_hook_kernel(const i64* __restrict__ indptr,
   }
 }
 
-// Full compression; flags[v] = 1 iff v is a root (the minimum id of its
-// component), flags[n] = 0 for the exclusive scan.
+// flags[v] = 1 iff v is a root (its component's minimum id), flags[n] = 0.
 __global__ void cc_flatten_kernel(i64 n, int* parent, int* __restrict__ flags)
 {
   volatile int* vp = parent;
@@ -160,7 +134,6 @@ __global__ void cc_flatten_kernel(i64 n, int* parent, int* __restrict__ flags)
   if (blockIdx.x == 0 && threadIdx.x == 0) flags[n] = 0;
 }
 
-// P[v] = rank[root(v)]: order-preserving relabel (= np.unique inverse).
 __global__ void cc_relabel_kernel(i64 n,
                                   const int* __restrict__ parent,
                                   const int* __restrict__ rank,
@@ -173,7 +146,7 @@ __global__ void cc_relabel_kernel(i64 n,
   if (blockIdx.x == 0 && threadIdx.x == 0) ctl->n_components = rank[n];
 }
 
-// CC_SPLIT(G, P): P <- COMPACT(component min-id). The graph has n rows.
+// CC_SPLIT: P <- COMPACT(component minimum).
 template <WKind K>
 void run_cc_split(const i64* indptr,
                   const int* indices,
@@ -204,21 +177,12 @@ void run_cc_split(const i64* indptr,
   RAFT_CHECK_CUDA(s);
 }
 
-// ---------------------------------------------------------------------------
-// F3 / F4: modularity (§4.13, §9.3)
-// ---------------------------------------------------------------------------
-
-// Few-address reductions (§7, red team RE8): community volumes and sizes are
-// warp-aggregated with __match_any_sync (one atomic per distinct community
-// per 32 rows) into a block-privatised shared histogram when C <= 1024,
-// else into global memory. Integer sums: exact and order-free. (Above 1024
-// communities the per-block histogram costs more than it saves: 1.06 ms vs
-// 0.50 ms at C = 4096 on brain500k.)
+// Community volumes are warp-aggregated into a block-privatised histogram for
+// C <= 1024, else into global memory; integer sums are exact and order-free.
 constexpr int kSmemCommunities = 1024;
 
-// Warp per union row x = r n + v over the single-copy graph (rows of the
-// replica union are shifted copies): L_hat[r] += intra-community counted
-// weight (block-reduced), K[P[x]] += k_hat_v, repmask[P[x]] |= 1 << r.
+// Warp per union row x = r n + v of the single-copy graph: L_hat[r] +=
+// intra-community counted weight, K[P[x]] += k_hat_v, repmask[P[x]] |= 1 << r.
 template <WKind K, bool kSmem>
 __global__ void quality_rows_kernel(const i64* __restrict__ indptr,
                                     const int* __restrict__ indices,
@@ -247,8 +211,6 @@ __global__ void quality_rows_kernel(const i64* __restrict__ indptr,
   const i64 rows         = static_cast<i64>(R) * n;
   i64 lacc[kMaxReplicas] = {0, 0, 0, 0};
   u32 bad                = 0;
-  // Each warp takes its grid-stride rows in groups of 32; lane i keeps the
-  // community and k_hat of the group's i-th row for the aggregation.
   for (i64 base = warp0; base < rows; base += kWarp * nwarps) {
     int my_c = -1, my_r = 0;
     i64 my_k = 0;
@@ -263,9 +225,9 @@ __global__ void quality_rows_kernel(const i64* __restrict__ indptr,
       const i64 b = indptr[v], e = indptr[v + 1];
       i64 l = 0;
       for (i64 j = b + lane; j < e; j += kWarp) {
-        const int u = indices[j];
+        const int u = __ldcs(&indices[j]);
         if (u == v || P[off + u] != pv) continue;
-        l += w(j);
+        l += w.cs(j);
       }
       l = warp_sum(l);
       if (!valid) {
@@ -317,8 +279,7 @@ __global__ void quality_rows_kernel(const i64* __restrict__ indptr,
   }
 }
 
-// t_c = (K_c / 2m)^2 for every community (grid-wide; the divisions are the
-// expensive part, so they do not run on the single tree block).
+// t_c = (K_c / 2m)^2, grid-wide (the divisions stay off the tree block).
 __global__ void volume_terms_kernel(const i64* __restrict__ Kc,
                                     i64 C,
                                     i64 two_m,
@@ -329,11 +290,7 @@ __global__ void volume_terms_kernel(const i64* __restrict__ Kc,
     t[c] = volume_term(Kc[c], two_m);
 }
 
-// One 1024-thread block per replica. R == 1: TREE1024 over t_0 .. t_{C-1}.
-// R > 1: TREE1024 over the subsequence of communities of replica r in
-// ascending id order (= the single-copy Q of replica r's partition after
-// COMPACT); chunks of 1024 ids are compacted with a block scan and every
-// item is added by thread (sequence index mod 1024), in ascending order.
+// A block per replica: TREE1024 over its communities' t_c, ascending ids.
 __global__ void __launch_bounds__(kTreeThreads) quality_tree_kernel(const double* __restrict__ t,
                                                                     const int* __restrict__ repmask,
                                                                     i64 C,
@@ -381,9 +338,8 @@ __global__ void __launch_bounds__(kTreeThreads) quality_tree_kernel(const double
   }
 }
 
-// Q of partition P (compact ids in [0, C); R copies of n vertices each, the
-// graph and k_hat being the single copy) with one copy's 2m_hat. Results land
-// in ctl->l_hat / sum_t / q [r]; K_hat per community in fb.K.
+// Q of partition P (compact ids < C; R copies of n vertices, the graph and
+// k_hat the single copy) with one copy's 2m_hat: ctl->l_hat / sum_t / q [r].
 template <WKind K>
 void run_quality(const i64* indptr,
                  const int* indices,
@@ -405,13 +361,18 @@ void run_quality(const i64* indptr,
     RAFT_CUDA_TRY(cudaMemsetAsync(fb.rep, 0, C * sizeof(int), s));
   }
   if (n > 0 && C > 0) {
-    const unsigned g = grid_rows(static_cast<i64>(R) * n);
+    const i64 rows = static_cast<i64>(R) * n;
     if (C <= kSmemCommunities) {
-      quality_rows_kernel<K, true><<<g, kBlock, C * sizeof(i64), s>>>(
-        indptr, indices, w, khat, P, n, R, C, fb.K, fb.rep, ctl);
+      const std::size_t smem = C * sizeof(i64);
+      quality_rows_kernel<K, true>
+        <<<grid_occ(quality_rows_kernel<K, true>, rows, kWarpsPerBlock, kBlock, smem),
+           kBlock,
+           smem,
+           s>>>(indptr, indices, w, khat, P, n, R, C, fb.K, fb.rep, ctl);
     } else {
       quality_rows_kernel<K, false>
-        <<<g, kBlock, 0, s>>>(indptr, indices, w, khat, P, n, R, C, fb.K, fb.rep, ctl);
+        <<<grid_occ(quality_rows_kernel<K, false>, rows, kWarpsPerBlock), kBlock, 0, s>>>(
+          indptr, indices, w, khat, P, n, R, C, fb.K, fb.rep, ctl);
     }
     RAFT_CHECK_CUDA(s);
   }
@@ -423,14 +384,9 @@ void run_quality(const i64* indptr,
   RAFT_CHECK_CUDA(s);
 }
 
-// ---------------------------------------------------------------------------
-// F5: size-ordered labels
-// ---------------------------------------------------------------------------
-
 constexpr int kSmemLabelCommunities = 4096;
 
-// size_c and minv_c with warp aggregation: lanes of a warp hold consecutive
-// vertices, so the group leader (lowest lane) carries the group's minimum id.
+// size_c and minv_c (the group leader, the lowest lane, holds the minimum id).
 template <bool kSmem>
 __global__ void label_count_kernel(const int* __restrict__ P,
                                    i64 n,
@@ -487,7 +443,7 @@ __global__ void label_count_kernel(const int* __restrict__ P,
 }
 
 // key_c = ((2^31 - 1 - size_c) << 32) | minv_c: ascending = size-descending,
-// ties by the smallest vertex id (unique, so no further tie-break exists).
+// ties by the smallest vertex id.
 __global__ void label_keys_kernel(i64 C,
                                   const int* __restrict__ size,
                                   const int* __restrict__ minv,
@@ -511,19 +467,15 @@ __global__ void label_rank_kernel(i64 C,
     label_of[sorted_vals[i]] = static_cast<int>(i);
 }
 
-// labels_out[v] = label(P[perm ? perm[v] : v]); `perm` maps input ids to
-// internal (BFS-renumbered, §4.2.2) ids, as the reference's labels[perm].
 __global__ void label_gather_kernel(const int* __restrict__ P,
                                     i64 n,
                                     i64 C,
                                     const int* __restrict__ label_of,
-                                    const int* __restrict__ perm,
                                     int* __restrict__ labels_out)
 {
   const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
   for (i64 v = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x; v < n; v += stride) {
-    const i64 x   = perm ? perm[v] : v;
-    const int c   = (x >= 0 && x < n) ? P[x] : -1;
+    const int c   = P[v];
     labels_out[v] = (c >= 0 && c < C) ? label_of[c] : -1;  // -1: flagged
   }
 }
@@ -531,7 +483,6 @@ __global__ void label_gather_kernel(const int* __restrict__ P,
 inline void run_rank_labels(const int* P,
                             i64 n,
                             i64 C,
-                            const int* perm,
                             int* labels_out,
                             const FinalBufs& fb,
                             void* cub,
@@ -566,18 +517,11 @@ inline void run_rank_labels(const int* P,
                                                 s));
   label_rank_kernel<<<gc, kBlock, 0, s>>>(C, fb.vals_out, fb.label_of);
   RAFT_CHECK_CUDA(s);
-  label_gather_kernel<<<gi, kBlock, 0, s>>>(P, n, C, fb.label_of, perm, labels_out);
+  label_gather_kernel<<<gi, kBlock, 0, s>>>(P, n, C, fb.label_of, labels_out);
   RAFT_CHECK_CUDA(s);
 }
 
-// ---------------------------------------------------------------------------
-// Weight dispatch
-// ---------------------------------------------------------------------------
-
-// Level graphs use the internal form: int64 offsets, int32 indices and fp32
-// weights (quantised on the fly with `scale` = 2^s at level 0; 1 at coarse
-// levels), int64 weights (W0q), or none (every off-diagonal entry weighs
-// `unit_weight` quanta). Calls fn with the matching EdgeW accessor.
+// Calls fn with the EdgeW of fp32 (scaled on the fly), int64 or unit weights.
 template <typename Fn>
 void dispatch_weights(const float* wf, const i64* wq, double scale, i64 unit_weight, Fn&& fn)
 {

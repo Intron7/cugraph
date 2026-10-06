@@ -4,33 +4,28 @@
  */
 #pragma once
 
-// Host driver of the deterministic Leiden engine (spec §4.5, §4.10-§4.14, §8.2): LeidenDriver.
-// Included by driver.cu only (the engine translation unit; see driver.hpp).
+// Host driver of the Leiden engine: LeidenDriver. Included by driver_common.cu only (the engine
+// translation unit; see driver.hpp).
 //
 // The typed entry point runs the input path first (I1 ingest_check, layout, workspace, I2 (+ I4)
 // quantisation of level 0, see kernels_ingest.cuh); run_engine then runs one resolution:
 //
-//   per iteration:
-//     per level: LOCAL_MOVE (DOWN), COMPACT                         -> SL1
-//                C == n: all-active TOP sweeps (certify or re-enter)
-//                PLEIDEN_R, AGGREGATE stage 1                        -> SL2
-//                refinement merged nothing: re-enter TOP (Lemma R,
-//                  <= max_reentry times), then the CC-piece last resort
-//                AGGREGATE stage 2 (compaction or two-pass level)
-//     projection to level 0, with the V-cycle (UP sweeps + COMPACT per
-//     level) in every iteration but the last
-//     CC split; with replicas: Q_r and the chosen replica's slice
-//     (n_iterations = -1: exact Q and the stop rules)
-//   FINALIZE: exact Q, size-ordered labels into labels_out
+//   per iteration, per level: LOCAL_MOVE (DOWN) + COMPACT              -> SL1
+//     (C == n: all-active TOP sweeps certify or re-enter), PLEIDEN_R +
+//     AGGREGATE stage 1 -> SL2 (nothing merged: re-enter TOP, then the
+//     CC-piece last resort), AGGREGATE stage 2; projection to level 0 with
+//     V-cycle UP sweeps, the CC split and, with replicas, the best slice
+//   exact Q, size-ordered labels
 //
-// Every kernel runs on the caller's stream; the readbacks (one per sweep,
-// SL1, SL2 and a few per iteration) go through the layout's pinned buffer when
-// there is one. Nothing is allocated: every array is carved from the workspace,
-// and the level stack lives in the checked arena (a level that does not fit
-// runs two-pass; run_engine returns false only if even that fails).
+// SL1 and SL2 are the host synchronisations of a level: the sweeps of a LOCAL_MOVE run in launch
+// chunks without a readback, and the refinement and AGGREGATE stage 1 are launched before the
+// host knows the number of move communities, so one readback delivers both. Every kernel and
+// CUDA graph runs on the caller's stream; nothing is allocated on the device (every array is
+// carved from the workspace, and the level stack lives in the checked arena).
 
 #include "community/detail/leiden/arena.cuh"
 #include "community/detail/leiden/driver.hpp"
+#include "community/detail/leiden/graph.cuh"
 #include "community/detail/leiden/kernels_aggregate.cuh"
 #include "community/detail/leiden/kernels_final.cuh"
 #include "community/detail/leiden/kernels_move.cuh"
@@ -45,43 +40,33 @@
 
 #include <cuda_runtime.h>
 
-#include <climits>
 #include <cmath>
-#include <cstdint>
 #include <limits>
 #include <utility>
 #include <vector>
 
 namespace cugraph::detail::leiden_engine {
 
-constexpr double kDeltaQStop = 1e-6;  // n_iterations = -1, rule (b) (§4.14)
+// n_iterations = -1 stops once an iteration moved no vertex, gained less than kDeltaQStop in Q,
+// or after max_iter_until_stable iterations.
+constexpr double kDeltaQStop = 1e-6;
 
-// Knobs of one call (§11.1); the defaults are the spec's.
+// Knobs of one call (run_engine sets n_iterations, max_levels and graph_mode).
 struct DriverParams {
   int n_iterations          = 2;  // >= 1, or -1 (until stable)
   int move_sweeps           = 4;  // DOWN cap
   int subrounds             = kNumSubrounds;
   int vcycle_sweeps         = 4;  // UP cap; 0 = no V-cycle
   bool vcycle_last          = false;
-  int top_sweeps            = 32;  // TOP cap (§4.10)
+  int top_sweeps            = 32;  // TOP cap
   int max_levels            = kMaxLevels;
-  int max_reentry           = 4;  // TOP re-entries per level (Lemma R)
+  int max_reentry           = 4;  // TOP re-entries of a level whose refinement merged nothing
   int max_iter_until_stable = 20;
-  int max_replicas          = kMaxReplicas;
-  i64 replica_nnz_budget    = kReplicaNnzBudget;
-  double arena_factor       = 1.9;
-  bool low_memory           = false;
-  int force_replica         = -1;     // tests (_FORCE_REPLICA)
-  bool force_two_pass       = false;  // tests: every level two-pass
-  bool force_second_gather  = false;  // tests: compaction "does not fit"
+  int graph_mode            = 2;  // 0: launches, 1: graph replays, 2: WHILE node (see EngineParams)
   ClassThresholds th{};
   GatherClasses gather{};
   TreeClasses trees{};
 };
-
-// ---------------------------------------------------------------------------
-// Small driver kernels
-// ---------------------------------------------------------------------------
 
 __global__ void drv_iota_kernel(int* __restrict__ P, i64 n)
 {
@@ -90,18 +75,6 @@ __global__ void drv_iota_kernel(int* __restrict__ P, i64 n)
     P[v] = static_cast<int>(v);
 }
 
-// Flags ids outside [0, bound) (the initial membership: compact ids < n).
-__global__ void drv_check_labels_kernel(const int* __restrict__ P, i64 n, i64 bound, Control* ctl)
-{
-  const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
-  bool bad         = false;
-  for (i64 v = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x; v < n; v += stride)
-    bad = bad || P[v] < 0 || P[v] >= bound;
-  if (__any_sync(kFullMask, bad) && (threadIdx.x & (kWarp - 1)) == 0)
-    atomicOr(&ctl->flags, kFlagBadLabel);
-}
-
-// Partition of the replica union (§4.2.1): P[r n + v] = P[v] + r n, r >= 1.
 __global__ void drv_replicate_partition_kernel(int* __restrict__ P, i64 n, int R)
 {
   const i64 stride = static_cast<i64>(gridDim.x) * blockDim.x;
@@ -112,8 +85,7 @@ __global__ void drv_replicate_partition_kernel(int* __restrict__ P, i64 n, int R
   }
 }
 
-// COMPACT_U of one replica slice (§4.2.1, RA8): flags of the ids the slice
-// uses (domain [0, C), no offset), then P_out[v] = rank[P_in[v]].
+// COMPACT of one replica slice: flags of its ids (< C), then their ranks.
 __global__ void drv_slice_flags_kernel(
   const int* __restrict__ P, i64 n, i64 C, int* __restrict__ flags, Control* ctl)
 {
@@ -142,55 +114,17 @@ __global__ void drv_slice_relabel_kernel(const int* __restrict__ P_in,
   if (blockIdx.x == 0 && threadIdx.x == 0) ctl->n_components = rank[C];
 }
 
-// ---------------------------------------------------------------------------
-// Statistics of a call (iterations and levels feed leiden_result_t)
-// ---------------------------------------------------------------------------
-
-struct LevelStat {
-  i64 n = 0, nnz = 0;
-  i64 C                = -1;  // communities after the last move phase of the level
-  i64 moves            = 0;
-  int sweeps           = 0;
-  int top_phases       = 0;
-  int top_sweeps       = 0;
-  i64 top_moves        = 0;
-  i64 n_next           = -1;
-  int reentries        = 0;
-  const char* layout   = "";  // "holey" | "two_pass" (aggregated levels)
-  bool second_gather   = false;
-  const char* fallback = "";  // "" | "cc" | "pieces_are_singletons"
-};
-
+// One iteration: whether a vertex moved (stop rule of n_iterations = -1) and its levels.
 struct IterationStat {
-  bool vcycle      = false;
-  bool moved       = false;
-  i64 cc_pieces    = 0;
-  int reentries    = 0;
-  int fallbacks    = 0;
-  bool uncertified = false;
-  bool top_cap_hit = false;
-  std::vector<double> replica_q;
-  int replica_chosen = -1;
-  double q           = std::numeric_limits<double>::quiet_NaN();  // T = -1 only
-  std::vector<LevelStat> levels;
-  std::vector<i64> vcycle_moves;
+  bool moved = false;
+  int levels = 0;
 };
 
 struct ResolutionResult {
-  double modularity     = 0.0;
-  i64 n_clusters        = 0;
-  i64 l_hat             = 0;
-  int scale_exponent    = 0;
-  i64 two_m_hat         = 0;
-  int replicas          = 1;
-  const char* stop_rule = "";  // n_iterations = -1: the rule that stopped
-  bool trivial          = false;
+  double modularity = 0.0;
+  i64 n_clusters    = 0;
   std::vector<IterationStat> iters;
 };
-
-// ---------------------------------------------------------------------------
-// One level of the hierarchy (host view)
-// ---------------------------------------------------------------------------
 
 struct LevelGraph {
   const i64* indptr  = nullptr;
@@ -202,8 +136,8 @@ struct LevelGraph {
   double scale    = 1.0;
   const i64* khat = nullptr;
   i64 n = 0, nnz = 0;
-  i64 cls[kNumClasses] = {0, 0, 0, 0};  // vertices per degree class
-  int* cmap            = nullptr;       // to level l + 1 (arena bottom)
+  i64 cls[kNumClasses] = {};       // vertices per degree class
+  int* cmap            = nullptr;  // to level l + 1 (arena bottom)
 
   template <typename Fn>
   void with_w(Fn&& fn) const
@@ -212,17 +146,10 @@ struct LevelGraph {
   }
 };
 
-// ---------------------------------------------------------------------------
-// The driver (P = 1)
-// ---------------------------------------------------------------------------
-
 class LeidenDriver {
  public:
   LeidenDriver(Layout& L, const DriverParams& dp, cudaStream_t s) : L_(L), dp_(dp), s_(s) {}
 
-  i64 syncs() const { return syncs_; }
-
-  // Level 0 after I2 (+ I4) for the current scale.
   void set_level0(const QuantizeResult& q, i64 n, i64 nnz)
   {
     q_          = q;
@@ -242,18 +169,12 @@ class LeidenDriver {
       g0_.cls[c] = q.class_count[c];
   }
 
-  // LEIDEN_CALL body of one resolution (§4.5). Returns false if the arena
-  // overflowed even with two-pass levels (workspace too small).
-  bool run_resolution(
-    double gamma, u32 seed, const int* init, int R, int* labels_out, ResolutionResult& out)
+  // One resolution from the singleton partition; false if the arena overflowed.
+  bool run_resolution(double gamma, u32 seed, int R, int* labels_out, ResolutionResult& out)
   {
-    const i64 n        = n_;
-    const i64 two_m    = q_.two_m_hat;
-    out.scale_exponent = q_.s;
-    out.two_m_hat      = two_m;
-    out.replicas       = R;
+    const i64 n     = n_;
+    const i64 two_m = q_.two_m_hat;
     if (two_m <= 0) {  // no counted entry: every vertex its own cluster
-      out.trivial    = true;
       out.n_clusters = n;
       drv_iota_kernel<<<grid_items(n), kBlock, 0, s_>>>(labels_out, n);
       RAFT_CHECK_CUDA(s_);
@@ -264,21 +185,8 @@ class LeidenDriver {
     seed_   = seed;
     s64_    = seed64(seed);
     int* P0 = L_.persist.P0;
-    // P0 <- the initial membership (compact ids, checked < n here) or
-    // the singletons
-    if (init) {
-      RAFT_CUDA_TRY(cudaMemcpyAsync(P0, init, n * sizeof(int), cudaMemcpyDeviceToDevice, s_));
-      drv_check_labels_kernel<<<grid_items(n), kBlock, 0, s_>>>(P0, n, n, L_.ctl);
-      RAFT_CHECK_CUDA(s_);
-      ++syncs_;
-      const Control c = read_control(L_.ctl, s_, L_.pinned);
-      CUGRAPH_EXPECTS(!(c.flags & kFlagBadLabel),
-                      "leiden: the initial membership must "
-                      "hold community ids in [0, n).");
-    } else {
-      drv_iota_kernel<<<grid_items(n), kBlock, 0, s_>>>(P0, n);
-      RAFT_CHECK_CUDA(s_);
-    }
+    drv_iota_kernel<<<grid_items(n), kBlock, 0, s_>>>(P0, n);
+    RAFT_CHECK_CUDA(s_);
     i64 C         = n;  // id bound of P0
     const int T   = dp_.n_iterations;
     const int V   = dp_.vcycle_sweeps;
@@ -288,18 +196,15 @@ class LeidenDriver {
     while (true) {
       const bool final  = (T >= 1 && it == T - 1) || (T == -1 && stop);
       const bool vcycle = V > 0 && (!final || T == 1 || dp_.vcycle_last);
-      IterationStat ist;
-      ist.vcycle = vcycle;
+      IterationStat stat;
       if (it == 0 && R > 1) {
-        // replica union (§4.2.1): R disjoint copies, one hierarchy
         drv_replicate_partition_kernel<<<grid_items(n), kBlock, 0, s_>>>(P0, n, R);
         RAFT_CHECK_CUDA(s_);
         const LevelGraph gu = union_level(R);
         i64 Cb              = 0;
-        if (!leiden_iteration(gu, P0, gu.n, it, vcycle, ist, Cb)) return false;
-        const i64 Cu  = cc_split(gu, P0);  // union ranks [0, Cu)
-        ist.cc_pieces = Cu - Cb;
-        // Q_r of each replica with one copy's 2m_hat (§4.13)
+        if (!leiden_iteration(gu, P0, gu.n, it, vcycle, stat, Cb)) return false;
+        const i64 Cu = cc_split(gu, P0);  // union ranks [0, Cu)
+        // Q_r of each replica with one copy's 2m_hat
         g0_.with_w([&](auto w) {
           run_quality(g0_.indptr,
                       g0_.indices,
@@ -317,47 +222,28 @@ class LeidenDriver {
         });
         const Control c = readback();
         int best        = 0;
-        for (int r = 0; r < R; ++r) {
-          ist.replica_q.push_back(c.q[r]);
+        for (int r = 1; r < R; ++r)
           if (c.q[r] > c.q[best]) best = r;  // ties -> lowest r
-        }
-        if (dp_.force_replica >= 0) {
-          CUGRAPH_EXPECTS(dp_.force_replica < R,
-                          "leiden: force_replica must be "
-                          "< the number of replicas.");
-          best = dp_.force_replica;
-        }
-        ist.replica_chosen = best;
-        C                  = compact_slice(P0 + static_cast<i64>(best) * n, n, Cu, P0);
+        C = compact_slice(P0 + static_cast<i64>(best) * n, n, Cu, P0);
       } else {
         i64 Cb = 0;
-        if (!leiden_iteration(g0_, P0, C, it, vcycle, ist, Cb)) return false;
-        C             = cc_split(g0_, P0);
-        ist.cc_pieces = C - Cb;
+        if (!leiden_iteration(g0_, P0, C, it, vcycle, stat, Cb)) return false;
+        C = cc_split(g0_, P0);
       }
       ++it;
-      if (!final && T == -1) {  // §4.14: is the next iteration final?
+      if (!final && T == -1) {  // is the next iteration final?
         const double q = quality(P0, C).q[0];
-        ist.q          = q;
-        if (!ist.moved)
-          out.stop_rule = "no_moves";
-        else if (q - q_prev < kDeltaQStop)
-          out.stop_rule = "delta_q";
-        else if (it == dp_.max_iter_until_stable)
-          out.stop_rule = "max_iterations";
-        stop   = out.stop_rule[0] != '\0';
-        q_prev = q;
+        stop           = !stat.moved || q - q_prev < kDeltaQStop || it == dp_.max_iter_until_stable;
+        q_prev         = q;
       }
-      out.iters.push_back(std::move(ist));
+      out.iters.push_back(std::move(stat));
       if (final) break;
     }
-    // FINALIZE (§4.13): exact Q, size-ordered labels
-    const Control c = quality(P0, C);
+    launch_quality(P0, C);
+    run_rank_labels(P0, n, C, labels_out, L_.final_, L_.cub, L_.cub_bytes, L_.ctl, s_);
+    const Control c = readback();
     out.modularity  = c.q[0];
-    out.l_hat       = c.l_hat[0];
     out.n_clusters  = C;
-    run_rank_labels(P0, n, C, nullptr, labels_out, L_.final_, L_.cub, L_.cub_bytes, L_.ctl, s_);
-    readback();  // flags of the label kernels
     return true;
   }
 
@@ -365,33 +251,31 @@ class LeidenDriver {
   Layout& L_;
   DriverParams dp_;
   cudaStream_t s_;
-  i64 syncs_ = 0;
   QuantizeResult q_;
   LevelGraph g0_;
   i64 n_ = 0, nnz_ = 0;
   double lam_ = 0.0, gamma_ = 0.0;
   u32 seed_ = 0;
   u64 s64_  = 0;
+  MoveLaunch ml_;                // sweep calls, reused by every LOCAL_MOVE
+  GraphChain graphs_[3];         // one sweep graph per weight kind (WKind)
+  GraphChain refine_graphs_[3];  // PLEIDEN_R R1 - R8, per weight kind
+  GraphChain stage1_graph_;      // R9 + AGGREGATE stage 1
+  GraphChain compact_graph_;     // COMPACT when refinement is not launched
 
   // Control readback (one sync) with the device invariant checks.
   Control readback()
   {
-    ++syncs_;
     const Control c = read_control(L_.ctl, s_, L_.pinned);
     CUGRAPH_EXPECTS(!(c.flags & kFlagForestInvariant),
-                    "leiden: internal error: refinement "
-                    "forest invariant violated.");
+                    "leiden: internal error: refinement forest invariant violated.");
     CUGRAPH_EXPECTS(!(c.flags & kFlagGatherInvariant),
-                    "leiden: internal error: multi-pass "
-                    "gather failed.");
+                    "leiden: internal error: multi-pass gather failed.");
     CUGRAPH_EXPECTS(!(c.flags & kFlagBadLabel),
-                    "leiden: internal error: community id "
-                    "out of range.");
+                    "leiden: internal error: community id out of range.");
     return c;
   }
 
-  // Partition of level l: P0 at level 0, then Pa / Pb alternately (the
-  // projection overwrites a level's partition from the level above).
   int* level_partition(int l) const
   {
     if (l == 0) return L_.persist.P0;
@@ -415,17 +299,17 @@ class LeidenDriver {
     return g;
   }
 
-  // LOCAL_MOVE + COMPACT on level l; P holds ids in [0, id_bound) on entry
-  // and the compacted move partition afterwards. Returns C (sync SL1).
-  i64 move_and_compact(const LevelGraph& g,
-                       int* P,
-                       int l,
-                       u32 phase,
-                       int cap,
-                       u32 sweep0,
-                       i64 id_bound,
-                       u32 it,
-                       MoveStats& st)
+  // LOCAL_MOVE + COMPACT on level l, launch only; a TOP phase launches its
+  // first chunk and a gated COMPACT (continue_move runs the rest).
+  MoveRun launch_move(const LevelGraph& g,
+                      int* P,
+                      int l,
+                      u32 phase,
+                      int cap,
+                      u32 sweep0,
+                      i64 id_bound,
+                      u32 it,
+                      std::vector<KernelCall>& compact)
   {
     MoveParams prm;
     prm.lam      = lam_;
@@ -438,15 +322,91 @@ class LeidenDriver {
     prm.S        = dp_.subrounds;
     prm.th       = dp_.th;
     prm.id_bound = id_bound;
+    MoveRun mr;
     g.with_w([&](auto w) {
-      st =
-        run_local_move(g.indptr, g.indices, w, g.khat, P, g.n, g.cls, prm, L_.move, L_.pinned, s_);
+      constexpr WKind KW = MoveWKindOf<decltype(w)>::value;
+      ml_.graph          = dp_.graph_mode > 0 ? &graphs_[static_cast<int>(KW)] : nullptr;
+      ml_.loop           = dp_.graph_mode == 2 && graph_loop_supported();
+      if (phase == kPhaseTop) {
+        // replays would run no-op sweeps after the certifying one
+        prm.first_chunk = ml_.graph && ml_.loop ? kSweepChunk : 1;
+        prm.defer_rest  = true;
+      }
+      mr = run_local_move(
+        g.indptr, g.indices, w, g.khat, P, g.n, g.cls, prm, L_.move, L_.ctl, ml_, L_.pinned, s_);
     });
-    syncs_ += st.sweeps + 1;
-    return run_compact(P, g.n, L_.move, L_.persist.KS, L_.cub, L_.cub_bytes, L_.pinned, s_);
+    launch_compact(
+      P, g.n, L_.move, L_.persist.KS, L_.cub, L_.cub_bytes, L_.ctl, s_, &compact, mr.gate());
+    return mr;
   }
 
-  // CC_SPLIT (§4.12) of the partition P on graph g; returns C.
+  // The rest of a deferred TOP phase: its chunks, COMPACT, the SL1 readback.
+  Control continue_move(const LevelGraph& g, int* P, MoveRun& mr)
+  {
+    continue_local_move(mr, ml_, L_.ctl, L_.pinned, s_);
+    std::vector<KernelCall> compact;
+    launch_compact(P, g.n, L_.move, L_.persist.KS, L_.cub, L_.cub_bytes, L_.ctl, s_, &compact);
+    launch_chain(compact, dp_.graph_mode > 0 ? &compact_graph_ : nullptr, s_);
+    const Control c = readback();  // SL1
+    finish_local_move(mr, c);
+    return c;
+  }
+
+  // PLEIDEN_R + AGGREGATE stage 1 of level l (C on the device; SL2 next).
+  void launch_refine_begin(const LevelGraph& g,
+                           const int* P,
+                           int l,
+                           u32 it,
+                           int* cmap,
+                           const AggregateOptions& opt,
+                           AggregatePlan& plan,
+                           std::vector<KernelCall> pre = {})
+  {
+    RefineParams rp;
+    rp.lam       = lam_;
+    rp.ctx_order = ctx(s64_, kTagOrder, it, static_cast<u32>(l), 0, 0);
+    rp.trees     = dp_.trees;
+    g.with_w([&](auto w) {
+      constexpr WKind KW = MoveWKindOf<decltype(w)>::value;
+      GraphChain* rg     = dp_.graph_mode > 0 ? &refine_graphs_[static_cast<int>(KW)] : nullptr;
+      std::vector<KernelCall> r9;  // runs with AGGREGATE stage 1
+      run_refine(g.indptr,
+                 g.indices,
+                 w,
+                 g.khat,
+                 P,
+                 L_.persist.KS,
+                 g.n,
+                 g.n,
+                 rp,
+                 L_.refine,
+                 cmap,
+                 L_.cub,
+                 L_.cub_bytes,
+                 L_.ctl,
+                 s_,
+                 &L_.ctl->move_C,
+                 rg,
+                 &r9,
+                 std::move(pre));
+      plan = aggregate_begin(g.indptr,
+                             g.indices,
+                             w,
+                             g.khat,
+                             g.n,
+                             g.nnz,
+                             cmap,
+                             opt,
+                             L_.aggregate,
+                             L_.arena,
+                             L_.cub,
+                             L_.cub_bytes,
+                             L_.ctl,
+                             s_,
+                             std::move(r9));
+    });
+  }
+
   i64 cc_split(const LevelGraph& g, int* P)
   {
     g.with_w([&](auto w) {
@@ -455,8 +415,7 @@ class LeidenDriver {
     return readback().n_components;
   }
 
-  // Exact Q (§4.13) of the compact single-copy partition P (C ids).
-  Control quality(const int* P, i64 C)
+  void launch_quality(const int* P, i64 C)
   {
     g0_.with_w([&](auto w) {
       run_quality(g0_.indptr,
@@ -473,11 +432,14 @@ class LeidenDriver {
                   L_.ctl,
                   s_);
     });
+  }
+  Control quality(const int* P, i64 C)
+  {
+    launch_quality(P, C);
     return readback();
   }
 
-  // COMPACT_U (§4.2.1): rank of each id of P_in[0, n) among the ids used
-  // in the slice (domain [0, C)), written to P_out; returns their number.
+  // Ranks P_in[0, n) among the ids its slice uses into P_out; returns C.
   i64 compact_slice(const int* P_in, i64 n, i64 C, int* P_out)
   {
     const FinalBufs& fb = L_.final_;
@@ -492,15 +454,14 @@ class LeidenDriver {
     return readback().n_components;
   }
 
-  // LEIDEN_ITERATION (§4.5) on the level-0 graph g0 with partition P0 (ids
-  // in [0, id_bound)). Returns false on arena overflow. C_out: communities
-  // of the level-0 partition before the CC split.
+  // One iteration on the level-0 graph g0 with partition P0 (ids < id_bound).
+  // False on arena overflow; C_out: communities before the CC split.
   bool leiden_iteration(const LevelGraph& g0,
                         int* P0,
                         i64 id_bound,
                         int it,
                         bool vcycle,
-                        IterationStat& ist,
+                        IterationStat& stat,
                         i64& C_out)
   {
     LevelArena& arena = L_.arena;
@@ -513,101 +474,79 @@ class LeidenDriver {
     int lvl       = 0;
     u32 phase     = kPhaseDown;
     int reentry   = 0;
-    u32 top_done  = 0;  // TOP sweeps run at this level (cumulative, §4.4)
+    u32 top_done  = 0;  // TOP sweeps run at this level (cumulative)
     i64 idb       = id_bound;
-    LevelStat rec;
-    rec.n   = g0.n;
-    rec.nnz = g0.nnz;
     AggregateOptions opt;
-    opt.low_memory          = dp_.low_memory;
-    opt.force_two_pass      = dp_.force_two_pass;
-    opt.force_second_gather = dp_.force_second_gather;
-    opt.gather              = dp_.gather;
-    opt.move                = dp_.th;
+    opt.gather = dp_.gather;
+    opt.move   = dp_.th;
+    opt.stage1 = dp_.graph_mode > 0 ? &stage1_graph_ : nullptr;
     while (true) {
-      LevelGraph& g = G[lvl];
-      int* P        = level_partition(lvl);
-      MoveStats st;
-      i64 C = 0;
-      if (phase == kPhaseDown) {
-        C          = move_and_compact(g, P, lvl, kPhaseDown, dp_.move_sweeps, 0, idb, uit, st);
-        rec.moves  = st.moves;
-        rec.sweeps = st.sweeps;
+      LevelGraph& g  = G[lvl];
+      int* P         = level_partition(lvl);
+      const bool top = phase == kPhaseTop;
+      std::vector<KernelCall> compact;
+      MoveRun mr = launch_move(g,
+                               P,
+                               lvl,
+                               phase,
+                               top ? dp_.top_sweeps : dp_.move_sweeps,
+                               top ? top_done : 0,
+                               idb,
+                               uit,
+                               compact);
+      // Refinement and AGGREGATE stage 1 launch before the host knows C
+      // (one readback delivers C and SL2), except where C == n is likely
+      // (TOP, singleton levels); C == n or no merge restores the arena.
+      const bool speculate   = !top && !(lvl > 0 && idb == g.n);
+      const std::size_t mark = arena.bottom;
+      int* cmap = speculate ? arena.push_bottom<int>(static_cast<std::size_t>(g.n)) : nullptr;
+      AggregatePlan plan;
+      if (cmap) {  // COMPACT runs in refinement's graph
+        launch_refine_begin(g, P, lvl, uit, cmap, opt, plan, std::move(compact));
       } else {
-        C = move_and_compact(g, P, lvl, kPhaseTop, dp_.top_sweeps, top_done, idb, uit, st);
-        top_done += static_cast<u32>(st.sweeps);
-        rec.top_phases += 1;
-        rec.top_moves += st.moves;
-        rec.top_sweeps = static_cast<int>(top_done);
-        if (st.last > 0) ist.top_cap_hit = true;
+        launch_chain(compact, dp_.graph_mode > 0 ? &compact_graph_ : nullptr, s_);
       }
+      Control c = readback();  // SL1 (+ SL2)
+      finish_local_move(mr, c);
+      if (mr.more_sweeps()) {  // TOP only (never speculated)
+        CUGRAPH_EXPECTS(cmap == nullptr,
+                        "leiden: internal error: refinement speculated on a deferred move.");
+        c = continue_move(g, P, mr);
+      }
+      CUGRAPH_EXPECTS(c.move_C >= 0, "leiden: internal error: COMPACT gated off at SL1.");
+      const MoveStats& st = mr.st;
+      const i64 C         = c.move_C;
+      if (top) top_done += static_cast<u32>(st.sweeps);
       moved = moved || st.moves > 0;
       idb   = C;
-      rec.C = C;
       if (C == g.n) {
-        if (phase != kPhaseTop) {  // all-active verification (§4.10)
+        if (cmap) {  // drop the speculative refinement / level
+          arena.release_top();
+          arena.bottom = mark;
+        }
+        if (!top) {  // all-active verification
           phase = kPhaseTop;
           continue;
         }
-        ist.levels.push_back(rec);  // certified gamma-separated top
+        ++stat.levels;  // certified gamma-separated top
         break;
       }
-      // PLEIDEN_R + AGGREGATE stage 1 (speculative; SL2 after A4a)
-      const std::size_t mark = arena.bottom;
-      int* cmap              = arena.push_bottom<int>(static_cast<std::size_t>(g.n));
-      if (!cmap) return false;
-      RefineParams rp;
-      rp.lam       = lam_;
-      rp.ctx_order = ctx(s64_, kTagOrder, uit, static_cast<u32>(lvl), 0, 0);
-      rp.trees     = dp_.trees;
-      AggregatePlan plan;
-      g.with_w([&](auto w) {
-        run_refine(g.indptr,
-                   g.indices,
-                   w,
-                   g.khat,
-                   P,
-                   L_.persist.KS,
-                   g.n,
-                   C,
-                   rp,
-                   L_.refine,
-                   cmap,
-                   L_.cub,
-                   L_.cub_bytes,
-                   L_.ctl,
-                   s_);
-        plan = aggregate_begin(g.indptr,
-                               g.indices,
-                               w,
-                               g.khat,
-                               g.n,
-                               g.nnz,
-                               cmap,
-                               opt,
-                               L_.aggregate,
-                               arena,
-                               L_.cub,
-                               L_.cub_bytes,
-                               L_.ctl,
-                               s_);
-      });
-      Control c  = readback();  // SL2
-      rec.n_next = c.n_next;
+      if (!cmap) {  // refinement was not launched: launch it now
+        cmap = arena.push_bottom<int>(static_cast<std::size_t>(g.n));
+        if (!cmap) return false;  // the arena cannot hold this level
+        launch_refine_begin(g, P, lvl, uit, cmap, opt, plan);
+        c = readback();  // SL2
+      }
       if (c.n_next == g.n) {  // refinement merged nothing (C < n)
         arena.release_top();
         arena.bottom = mark;              // drop the speculative level
-        if (reentry < dp_.max_reentry) {  // Lemma R (§4.10)
+        if (reentry < dp_.max_reentry) {  // re-enter TOP sweeps at this level
           ++reentry;
-          ist.reentries += 1;
-          rec.reentries = reentry;
-          phase         = kPhaseTop;
+          phase = kPhaseTop;
           continue;
         }
         // last resort (never expected): the connected pieces of P
-        ist.fallbacks += 1;
-        ist.uncertified = true;
-        cmap            = arena.push_bottom<int>(static_cast<std::size_t>(g.n));
+        cmap = arena.push_bottom<int>(static_cast<std::size_t>(g.n));
         if (!cmap) return false;
         RAFT_CUDA_TRY(cudaMemcpyAsync(cmap, P, g.n * sizeof(int), cudaMemcpyDeviceToDevice, s_));
         const i64 pieces = cc_split(g, cmap);
@@ -615,11 +554,9 @@ class LeidenDriver {
           RAFT_CUDA_TRY(cudaMemcpyAsync(P, cmap, g.n * sizeof(int), cudaMemcpyDeviceToDevice, s_));
           arena.bottom = mark;
           idb          = g.n;
-          rec.fallback = "pieces_are_singletons";
-          ist.levels.push_back(rec);
+          ++stat.levels;
           break;
         }
-        rec.fallback = "cc";
         agg_set_n_next_kernel<<<1, 1, 0, s_>>>(L_.ctl, pieces);
         RAFT_CHECK_CUDA(s_);
         g.with_w([&](auto w) {
@@ -638,34 +575,21 @@ class LeidenDriver {
                                  L_.ctl,
                                  s_);
         });
-        c          = readback();
-        rec.n_next = c.n_next;
+        c = readback();
       }
-      // AGGREGATE stage 2: rows below the holey region, or two-pass
-      CoarseLevel lv;
-      g.with_w([&](auto w) {
-        lv = aggregate_finish(g.indptr,
-                              g.indices,
-                              w,
-                              g.khat,
-                              g.n,
-                              cmap,
-                              plan,
-                              c.n_next,
-                              c.nnz_next,
-                              opt,
-                              L_.aggregate,
-                              arena,
-                              P,
-                              level_partition(lvl + 1),
-                              L_.ctl,
-                              s_);
-      });
+      const CoarseLevel lv = aggregate_finish(g.n,
+                                              cmap,
+                                              plan,
+                                              c.n_next,
+                                              c.nnz_next,
+                                              L_.aggregate,
+                                              arena,
+                                              P,
+                                              level_partition(lvl + 1),
+                                              s_);
       if (!lv.ok) return false;
-      rec.layout        = lv.two_pass ? "two_pass" : "holey";
-      rec.second_gather = lv.second_gather;
-      g.cmap            = cmap;
-      ist.levels.push_back(rec);
+      g.cmap = cmap;
+      ++stat.levels;
       LevelGraph ng;
       ng.indptr  = lv.indptr;
       ng.indices = lv.indices;
@@ -676,35 +600,33 @@ class LeidenDriver {
       for (int k = 0; k < kNumClasses; ++k)
         ng.cls[k] = c.coarse_class_count[k];
       G.push_back(ng);  // (invalidates g)
-      // P_{l+1} holds the move partition's ids, < C <= n_{l+1}
       ++lvl;
       phase    = kPhaseDown;
       reentry  = 0;
       top_done = 0;
-      rec      = LevelStat{};
-      rec.n    = ng.n;
-      rec.nnz  = ng.nnz;
       if (lvl == dp_.max_levels) {  // guard; kNN graphs need 5-12
-        ist.levels.push_back(rec);
+        ++stat.levels;
         break;
       }
     }
-    // projection to level 0 (§4.5), with the V-cycle's UP sweeps in all
-    // but the final iteration (§4.11)
+    // projection to level 0, with the V-cycle's UP sweeps
     i64 Ccur = idb;
     for (int lp = lvl - 1; lp >= 0; --lp) {
       const LevelGraph& g = G[lp];
       int* P              = level_partition(lp);
       run_project(level_partition(lp + 1), g.cmap, g.n, P, s_);
       if (vcycle) {
-        MoveStats st;
-        Ccur  = move_and_compact(g, P, lp, kPhaseUp, dp_.vcycle_sweeps, 0, Ccur, uit, st);
-        moved = moved || st.moves > 0;
-        ist.vcycle_moves.push_back(st.moves);
+        std::vector<KernelCall> compact;
+        MoveRun mr = launch_move(g, P, lp, kPhaseUp, dp_.vcycle_sweeps, 0, Ccur, uit, compact);
+        launch_chain(compact, dp_.graph_mode > 0 ? &compact_graph_ : nullptr, s_);
+        const Control c = readback();  // SL1
+        finish_local_move(mr, c);
+        Ccur  = c.move_C;
+        moved = moved || mr.st.moves > 0;
       }
     }
-    ist.moved = moved;
-    C_out     = Ccur;
+    stat.moved = moved;
+    C_out      = Ccur;
     return true;
   }
 };

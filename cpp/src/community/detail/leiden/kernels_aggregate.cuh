@@ -4,85 +4,50 @@
  */
 #pragma once
 
-// AGGREGATE (spec §4.9, §6.3, §7 A1-A6): contraction of level l by the
-// refined partition (cmap, from R9) into level l + 1.
-//
-//   A1  agg_init / agg_count   member counts and windows win[c] = sum of the
-//                              stored degrees of c's members (zeroed first);
-//       2 scans                member and window offsets (int64 accumulators)
-//   A2  agg_scatter            members grouped by coarse id; coarse vertices
-//                              listed by gather class (window <= 128: warp,
-//                              <= 256: wide warp, else block)
-//   A3  agg_gather_warp        warp per coarse vertex, members' edges
-//                              flattened into 32-edge chunks, stamped table
-//                              per warp (stamp = coarse id): 256 slots (warp
-//                              class) or 512 slots (wide-warp class)
-//       agg_gather_block       block per coarse vertex: window <= 2048 in one
-//                              pass (table of nextpow2(win + 1) slots), larger
-//                              windows in hash-range passes over the
-//                              4096-slot table (npass doubles above 3072
-//                              distinct keys; no global memory)
-//                              Modes: holey (rows into the arena top at the
-//                              window offsets), count (row lengths only) and
-//                              write (rows at indptr_{l+1} in the arena
-//                              bottom). k_hat_{l+1}[c] = sum of the members'
-//                              k_hat in every mode (red team RA2).
-//   A4a scan(cdeg) + agg_stats indptr_{l+1}, nnz_{l+1}, degree classes and
-//                              max degree of level l + 1  -> SL2
-//   A4b agg_compact            holey rows -> arena bottom (one pass)
-//   A6  agg_finish             P_{l+1}[cmap_v] = P_l[v]; level metadata
-//
-// Every coarse row holds the exact int64 sums of its members' counted entries
-// towards other coarse vertices (intra-coarse entries are dropped, node
-// weights carried; igraph leiden.c:647-664), stored as __ll2float_rn(sum):
-// every stored value is an exactly representable integer >= 1. Row order is
-// hash-slot order: no consumer reads it (§4.9), so tests compare rows as
-// multisets. The per-level layout decision (§6.3) changes only where rows are
-// written, never their content.
+// AGGREGATE: contraction of level l by the refined partition (cmap). A1 member
+// counts and windows (sums of member degrees); A2 members grouped by coarse id,
+// listed by gather class; A3 gathers into hash tables; A4 scan, stats and
+// compaction of the holey rows into the arena bottom; A6 P_{l+1} and the level
+// metadata. A coarse row holds the exact int64 sums of its members' counted
+// entries towards other coarse vertices as fp32 (exact integers >= 1), in
+// hash-slot order (which nothing reads).
 
 #include "community/detail/leiden/arena.cuh"
-#include "community/detail/leiden/kernels_final.cuh"
+#include "community/detail/leiden/graph.cuh"
 #include "community/detail/leiden/kernels_refine.cuh"
+#include "community/detail/leiden/kernels_scan.cuh"
 #include "community/detail/leiden/numerics.cuh"
 
 #include <raft/util/cuda_rt_essentials.hpp>
 
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
-#include <cub/device/device_scan.cuh>
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <climits>
-#include <cstddef>
-#include <cstdint>
 #include <initializer_list>
+#include <vector>
 
 namespace cugraph::detail::leiden_engine {
 
-// Gather classes by window (sum of member degrees) and the multi-pass
-// capacity; runtime values so tests can force each path.
+// Gather classes by window, and the distinct keys per multi-pass pass.
 struct GatherClasses {
   int warp          = 128;   // <= 128: warp, 256-slot table (load <= 0.5)
   int wide          = 256;   // <= 256: warp, 512-slot table (load <= 0.5)
   int block         = 2048;  // <= 2048: block, one pass
   int pass_capacity = 3072;  // multi-pass: distinct keys per pass (0.75)
 };
-// Gather-class lists (A2): warp class from the front of clist, block class
-// from its back, wide-warp class in clist_wide; counts in
-// Control::gather_list_count[class].
+// clist: warp class from the front, block class from the back; wide: own list.
 enum : int { kGatherWarp = 0, kGatherBlock = 1, kGatherWide = 2 };
 
 struct AggregateOptions {
-  bool low_memory          = false;  // every level two-pass (layout only)
-  bool force_two_pass      = false;  // this level two-pass from the start
-  bool force_second_gather = false;  // holey gather, compaction "does not fit"
   GatherClasses gather;
-  ClassThresholds move;  // degree classes reported for level l + 1 (SL2)
+  ClassThresholds move;          // degree classes reported for level l + 1 (SL2)
+  GraphChain* stage1 = nullptr;  // aggregate_begin as one graph replay (null: launches)
 };
 
-// Error bit: the multi-pass gather could not separate a row's keys (never
-// expected; shares the Control flags word with the other bits).
 constexpr u32 kFlagGatherInvariant = 1u << 25;
 
 constexpr int kAggWarpSlots  = 256;  // warp class: 8 warps per block
@@ -91,33 +56,12 @@ constexpr int kAggWideWarps  = 4;
 constexpr int kAggBlockSlots = 4096;
 constexpr std::size_t kAggBlockSmem =
   kAggBlockSlots * (sizeof(u64) + sizeof(int));  // 48 KB dynamic
-constexpr u64 kAggEmpty    = ~0ull;              // stamp 0xffffffff is never a coarse id
-constexpr u32 kAggPassSalt = 0x2545F491u;
-
-enum : int { kAggCount = 0, kAggHoley = 1, kAggWrite = 2 };
-
-__device__ __forceinline__ unsigned agg_slot(int key) { return fmix32(static_cast<u32>(key)); }
-
-// Pass of a key among npass hash-range passes (any npass >= 1).
-__device__ __forceinline__ unsigned agg_pass(int key, unsigned npass)
-{
-  const u64 h = fmix32(static_cast<u32>(key) ^ kAggPassSalt);
-  return static_cast<unsigned>((h * npass) >> 32);
-}
-
-// nextpow2(x) for x >= 1 (x <= 2^30).
 __device__ __forceinline__ int agg_pow2(i64 x)
 {
   return x <= 1 ? 1 : 1 << (32 - __clz(static_cast<int>(x - 1)));
 }
 
-// ---------------------------------------------------------------------------
-// A1 / A2
-// ---------------------------------------------------------------------------
-
-// Zeroes [0, n] of the member counts, windows and coarse row lengths (entries
-// past n_{l+1} stay 0, so the scans can run over the host bound n + 1), the
-// gather-class counters and the level statistics (§6.5).
+// Zeroes [0, n] of the member counts, windows, row lengths and the counters.
 __global__ void agg_init_kernel(
   i64 n, int* __restrict__ mcnt, i64* __restrict__ win, i64* __restrict__ cdeg, Control* ctl)
 {
@@ -133,12 +77,9 @@ __global__ void agg_init_kernel(
     ctl->nnz_next = 0;
     for (int k = 0; k < kNumClasses; ++k)
       ctl->coarse_class_count[k] = 0;
-    ctl->coarse_max_degree = 0;
   }
 }
 
-// mcnt[c] += 1 and win[c] += deg_stored(v) for c = cmap_v (ids outside
-// [0, n_{l+1}) set kFlagBadLabel and are skipped).
 __global__ void agg_count_kernel(const i64* __restrict__ indptr,
                                  const int* __restrict__ cmap,
                                  i64 n,
@@ -160,9 +101,6 @@ __global__ void agg_count_kernel(const i64* __restrict__ indptr,
   }
 }
 
-// Members scattered by coarse id (the cursor is the remaining count); coarse
-// vertex i < n_{l+1} is listed by its window: warp class from the front of
-// clist, wide-warp class in clist_wide, block class from the back of clist.
 __global__ void agg_scatter_kernel(const int* __restrict__ cmap,
                                    i64 n,
                                    const i64* __restrict__ mstart,
@@ -202,18 +140,9 @@ __global__ void agg_scatter_kernel(const int* __restrict__ cmap,
   }
 }
 
-// ---------------------------------------------------------------------------
-// A3: gather (warp class)
-// ---------------------------------------------------------------------------
-
-// Warp per coarse vertex c of a warp class (window <= kSlots / 2: 128 with
-// 256 slots, 256 with 512 slots), listed in list[0 .. count). Up to 32
-// members at a time are flattened into chunks of 32 edges (a 5-step search
-// finds each lane's member); match_any pre-aggregates equal coarse
-// neighbours, and the group leader inserts into the warp's stamped table (u64
-// key c << 32 | cu, value set by the claimer; initialised to EMPTY at kernel
-// start, §6.5).
-template <WKind K, int kMode, int kSlots, int kWarps>
+// Warp per coarse vertex: members flattened into 32-edge chunks; match_any
+// pre-aggregates equal coarse neighbours, the group leader inserts.
+template <WKind K, int kSlots, int kWarps>
 __global__ void __launch_bounds__(kWarps* kWarp)
   agg_gather_warp_kernel(const i64* __restrict__ indptr,
                          const int* __restrict__ indices,
@@ -232,13 +161,14 @@ __global__ void __launch_bounds__(kWarps* kWarp)
                          i64* __restrict__ khat_next,
                          Control* ctl)
 {
-  __shared__ u64 tkey[kWarps][kSlots];
+  // int keys (-1 = free, restored by the output scan): 12 B per slot
+  __shared__ int tkey[kWarps][kSlots];
   __shared__ i64 tval[kWarps][kSlots];
   __shared__ i64 wsum[kWarps][kWarp];
   const int wib = threadIdx.x / kWarp, lane = threadIdx.x & (kWarp - 1);
-  volatile u64* vkey = tkey[wib];
+  volatile int* vkey = tkey[wib];
   for (int s = lane; s < kSlots; s += kWarp)
-    tkey[wib][s] = kAggEmpty;
+    tkey[wib][s] = -1;
   __syncwarp();
   const i64 warp0  = static_cast<i64>(blockIdx.x) * kWarps + wib;
   const i64 nwarps = static_cast<i64>(gridDim.x) * kWarps;
@@ -250,7 +180,7 @@ __global__ void __launch_bounds__(kWarps* kWarp)
     tsize                = tsize < kWarp ? kWarp : (tsize > kSlots ? kSlots : tsize);
     const unsigned tmask = static_cast<unsigned>(tsize - 1);
     const i64 m0 = mstart[c], m1 = mstart[c + 1];
-    const i64 ob = kMode == kAggCount ? 0 : out_off[c];
+    const i64 ob = out_off[c];
     i64 ks       = 0;
     for (i64 mb = m0; mb < m1; mb += kWarp) {
       const int nm = static_cast<int>(m1 - mb < kWarp ? m1 - mb : kWarp);
@@ -286,9 +216,9 @@ __global__ void __launch_bounds__(kWarps* kWarp)
         i64 x         = 0;
         if (t < total) {
           const i64 j = ebm + (t - exm);
-          const int u = indices[j];
+          const int u = __ldcs(&indices[j]);
           if (u != vm) {
-            x = w(j);
+            x = w.cs(j);
             if (x > 0) {
               cu = cmap[u];
               if (cu == c) cu = -1;  // intra-coarse: dropped
@@ -303,23 +233,7 @@ __global__ void __launch_bounds__(kWarps* kWarp)
           i64 sum = 0;
           for (unsigned mm = m; mm; mm &= mm - 1)
             sum += wsum[wib][__ffs(mm) - 1];
-          const u64 mine = (static_cast<u64>(c) << 32) | static_cast<u64>(static_cast<u32>(cu));
-          unsigned h     = agg_slot(cu) & tmask;
-          while (true) {
-            const u64 cur = vkey[h];
-            if (cur == mine) {
-              tval[wib][h] += sum;
-              break;
-            }
-            if (static_cast<u32>(cur >> 32) != static_cast<u32>(c)) {  // empty or stale stamp
-              if (atomicCAS(&tkey[wib][h], cur, mine) == cur) {
-                tval[wib][h] = sum;
-                break;
-              }
-              continue;  // lost the slot: re-read it
-            }
-            h = (h + 1) & tmask;
-          }
+          warp_table_add(tkey[wib], tval[wib], tmask, cu, sum);
         }
         __syncwarp();
       }
@@ -328,13 +242,14 @@ __global__ void __launch_bounds__(kWarps* kWarp)
     int out = 0;
     for (int s0 = 0; s0 < tsize; s0 += kWarp) {
       const int s       = s0 + lane;
-      const u64 kk      = vkey[s];
-      const bool f      = static_cast<u32>(kk >> 32) == static_cast<u32>(c);
+      const int kk      = vkey[s];
+      const bool f      = kk != -1;
       const unsigned bm = __ballot_sync(kFullMask, f);
-      if (kMode != kAggCount && f) {
+      if (f) {
         const i64 o = ob + out + __popc(bm & ((1u << lane) - 1u));
-        out_idx[o]  = static_cast<int>(static_cast<u32>(kk));
+        out_idx[o]  = kk;
         out_w[o]    = __ll2float_rn(tval[wib][s]);
+        vkey[s]     = -1;  // the next coarse vertex starts empty
       }
       out += __popc(bm);
     }
@@ -346,25 +261,16 @@ __global__ void __launch_bounds__(kWarps* kWarp)
   }
 }
 
-// ---------------------------------------------------------------------------
-// A3: gather (block class, one pass or hash-range multi-pass)
-// ---------------------------------------------------------------------------
-
-// Inserts (key, val) into the block table (int keys, -1 = empty; values are
-// zeroed with the table, so every inserter adds atomically). With a capacity
-// (multi-pass, cap < INT_MAX), a new key is claimed only while fewer than
-// `cap` keys are claimed (*cnt counts successful claims); otherwise *ovf is
-// set (read only after the next barrier) and the pass is discarded. At most
-// one claim per thread is in flight past the check, so the table holds fewer
-// than cap + kBlock < slots keys and every probe terminates; *ovf is set only
-// when the pass really holds more than cap distinct keys (contention between
-// inserters of one key never overflows), so the doubling of npass ends.
+// Inserts into the block table (values zeroed, inserters add). With a capacity
+// (multi-pass) a new key is claimed only while fewer than `cap` are, else *ovf
+// is set and the pass discarded; at most one claim per thread passes the check
+// (< cap + kBlock keys), so *ovf means > cap keys and npass doubling ends.
 __device__ __forceinline__ void agg_block_insert(
   int* tk, u64* tv, unsigned tmask, int key, i64 val, int* cnt, int* ovf, int cap)
 {
   volatile int* vk  = tk;
   const bool capped = cap < INT_MAX;
-  unsigned h        = agg_slot(key) & tmask;
+  unsigned h        = fmix32(static_cast<u32>(key)) & tmask;
   while (true) {
     const int cur = vk[h];
     if (cur == key) break;
@@ -385,37 +291,36 @@ __device__ __forceinline__ void agg_block_insert(
   atomicAdd(&tv[h], static_cast<u64>(val));
 }
 
-// Block per coarse vertex (block class: listed from the back of clist).
-// Members are processed in batches of kBlock (block scan of their degrees),
-// their edges in chunks of kBlock (binary search of the owning member);
-// match_any pre-aggregates within each warp. Windows <= gc.block run one pass
-// with nextpow2(win + 1) slots (cannot overflow). Larger windows run
-// hash-range passes over the 4096-slot table: pass p takes the keys with
-// agg_pass(key, npass) == p; npass starts at 1 and doubles (restarting the
-// row) whenever a pass exceeds gc.pass_capacity distinct keys. The table is
-// re-initialised before every pass; each pass appends its keys to the row.
-template <WKind K, int kMode>
-__global__ void __launch_bounds__(kBlock) agg_gather_block_kernel(const i64* __restrict__ indptr,
-                                                                  const int* __restrict__ indices,
-                                                                  EdgeW<K> w,
-                                                                  const i64* __restrict__ khat,
-                                                                  const int* __restrict__ cmap,
-                                                                  const i64* __restrict__ mstart,
-                                                                  const int* __restrict__ members,
-                                                                  const i64* __restrict__ woff,
-                                                                  const int* __restrict__ clist,
-                                                                  i64 n_list,
-                                                                  GatherClasses gc,
-                                                                  const i64* __restrict__ out_off,
-                                                                  int* __restrict__ out_idx,
-                                                                  float* __restrict__ out_w,
-                                                                  i64* __restrict__ cdeg,
-                                                                  i64* __restrict__ khat_next,
-                                                                  Control* ctl)
+// Block per coarse vertex: members in batches of kBlock, edges in chunks of
+// kBlock (binary search of the owner). Windows <= gc.block run one pass, larger
+// ones hash-range passes (table_pass(key, npass) == p), npass doubling.
+template <WKind K>
+__global__ void __launch_bounds__(kBlock, 4)
+  agg_gather_block_kernel(const i64* __restrict__ indptr,
+                          const int* __restrict__ indices,
+                          EdgeW<K> w,
+                          const i64* __restrict__ khat,
+                          const int* __restrict__ cmap,
+                          const i64* __restrict__ mstart,
+                          const int* __restrict__ members,
+                          const i64* __restrict__ woff,
+                          const int* __restrict__ clist,
+                          i64 n_list,
+                          GatherClasses gc,
+                          const i64* __restrict__ out_off,
+                          int* __restrict__ out_idx,
+                          float* __restrict__ out_w,
+                          i64* __restrict__ cdeg,
+                          i64* __restrict__ khat_next,
+                          Control* ctl,
+                          int slots,
+                          i64 win_lo,
+                          i64 win_hi)
 {
+  // `slots` entries; this launch takes the windows in [win_lo, win_hi]
   extern __shared__ __align__(16) unsigned char agg_smem[];
   u64* tv      = reinterpret_cast<u64*>(agg_smem);
-  int* tk      = reinterpret_cast<int*>(agg_smem + kAggBlockSlots * sizeof(u64));
+  int* tk      = reinterpret_cast<int*>(agg_smem + slots * sizeof(u64));
   using Scan   = cub::BlockScan<i64, kBlock>;
   using Reduce = cub::BlockReduce<i64, kBlock>;
   __shared__ union {
@@ -432,6 +337,7 @@ __global__ void __launch_bounds__(kBlock) agg_gather_block_kernel(const i64* __r
   for (i64 i = blockIdx.x; i < count; i += gridDim.x) {
     const int c   = clist[n_list - 1 - i];
     const i64 win = woff[c + 1] - woff[c];
+    if (win < win_lo || win > win_hi) continue;  // block-uniform
     const i64 m0 = mstart[c], m1 = mstart[c + 1];
     i64 ks = 0;
     for (i64 m = m0 + tid; m < m1; m += kBlock)
@@ -439,10 +345,10 @@ __global__ void __launch_bounds__(kBlock) agg_gather_block_kernel(const i64* __r
     ks = Reduce(tmp.reduce).Sum(ks);
     __syncthreads();
     const bool single    = win <= gc.block;
-    const int tsize      = single ? agg_pow2(win + 1) : kAggBlockSlots;
+    const int tsize      = single ? agg_pow2(win + 1) : slots;
     const unsigned tmask = static_cast<unsigned>(tsize - 1);
     const int cap        = single ? INT_MAX : gc.pass_capacity;
-    const i64 ob         = kMode == kAggCount ? 0 : out_off[c];
+    const i64 ob         = out_off[c];
     unsigned npass       = 1;
     while (true) {  // until a full set of passes ran without overflow
       if (tid == 0) s_out = 0;
@@ -486,12 +392,12 @@ __global__ void __launch_bounds__(kBlock) agg_gather_block_kernel(const i64* __r
                   hi = mid - 1;
               }
               const i64 j = s_eb[lo] + (t - s_excl[lo]);
-              const int u = indices[j];
+              const int u = __ldcs(&indices[j]);
               if (u != s_v[lo]) {
-                x = w(j);
+                x = w.cs(j);
                 if (x > 0) {
                   cu = cmap[u];
-                  if (cu == c || (npass > 1 && agg_pass(cu, npass) != p)) cu = -1;
+                  if (cu == c || (npass > 1 && table_pass(cu, npass) != p)) cu = -1;
                 }
               }
             }
@@ -520,7 +426,7 @@ __global__ void __launch_bounds__(kBlock) agg_gather_block_kernel(const i64* __r
           int base          = 0;
           if (lane == 0 && bm) base = atomicAdd(&s_out, __popc(bm));
           base = __shfl_sync(kFullMask, base, 0);
-          if (kMode != kAggCount && f) {
+          if (f) {
             const i64 o = ob + base + __popc(bm & ((1u << lane) - 1u));
             out_idx[o]  = tk[s];
             out_w[o]    = __ll2float_rn(static_cast<i64>(tv[s]));
@@ -544,38 +450,25 @@ __global__ void __launch_bounds__(kBlock) agg_gather_block_kernel(const i64* __r
   }
 }
 
-// ---------------------------------------------------------------------------
-// A4a / A4b / A6
-// ---------------------------------------------------------------------------
-
-// Degree classes (move thresholds) and max degree of level l + 1, and
-// nnz_{l+1} = indptr_{l+1}[n_{l+1}] (block-reduced, one atomic per block).
 __global__ void agg_stats_kernel(const i64* __restrict__ cdeg,
                                  const i64* __restrict__ indptr_next,
                                  ClassThresholds th,
                                  Control* ctl)
 {
   __shared__ i64 s_cls[kWarpsPerBlock][kNumClasses];
-  __shared__ i64 s_max[kWarpsPerBlock];
   const i64 nn         = ctl->n_next;
-  i64 cls[kNumClasses] = {0, 0, 0, 0};
-  i64 mx               = 0;
+  i64 cls[kNumClasses] = {};
   const i64 stride     = static_cast<i64>(gridDim.x) * blockDim.x;
   for (i64 c = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x; c < nn; c += stride) {
-    const i64 d = cdeg[c];
-    cls[degree_class(d, th)] += 1;
-    mx = d > mx ? d : mx;
+    cls[degree_class(cdeg[c], th)] += 1;
   }
   const int wib = threadIdx.x / kWarp, lane = threadIdx.x & (kWarp - 1);
 #pragma unroll
   for (int k = 0; k < kNumClasses; ++k)
     cls[k] = warp_sum(cls[k]);
-  mx = warp_max(mx);
-  if (lane == 0) {
+  if (lane == 0)
     for (int k = 0; k < kNumClasses; ++k)
       s_cls[wib][k] = cls[k];
-    s_max[wib] = mx;
-  }
   __syncthreads();
   if (threadIdx.x < kNumClasses) {
     i64 t = 0;
@@ -584,18 +477,10 @@ __global__ void agg_stats_kernel(const i64* __restrict__ cdeg,
     if (t)
       atomicAdd(reinterpret_cast<u64*>(&ctl->coarse_class_count[threadIdx.x]), static_cast<u64>(t));
   }
-  if (threadIdx.x == kNumClasses) {
-    i64 t = 0;
-    for (int q = 0; q < kWarpsPerBlock; ++q)
-      t = s_max[q] > t ? s_max[q] : t;
-    if (t) atomicMax(reinterpret_cast<u64*>(&ctl->coarse_max_degree), static_cast<u64>(t));
-  }
   if (blockIdx.x == 0 && threadIdx.x == 0) ctl->nnz_next = indptr_next[nn];
 }
 
-// Holey rows (at the window offsets, arena top) -> compacted rows at
-// indptr_{l+1} (arena bottom). A warp takes 32 rows: lane i prefetches row
-// i's offsets, then the warp copies the rows one after the other.
+// Holey rows (window offsets, arena top) -> compacted rows (arena bottom).
 __global__ void agg_compact_kernel(const i64* __restrict__ woff,
                                    const i64* __restrict__ cdeg,
                                    const i64* __restrict__ indptr_next,
@@ -629,10 +514,8 @@ __global__ void agg_compact_kernel(const i64* __restrict__ woff,
   }
 }
 
-// A6 + level metadata: P_{l+1}[cmap_v] = P_l[v] (every member of a coarse
-// vertex carries the same move community, so the racing stores are
-// identical); indptr_{l+1} and k_hat_{l+1} copied from the phase scratch into
-// their exact-size slots in the arena bottom.
+// A6: P_{l+1}[cmap_v] = P_l[v] (members share a move community, so racing
+// stores agree); indptr_{l+1} and k_hat_{l+1} into exact-size arena slots.
 __global__ void agg_finish_kernel(i64 n,
                                   i64 nn,
                                   const int* __restrict__ cmap,
@@ -654,12 +537,6 @@ __global__ void agg_finish_kernel(i64 n,
 
 __global__ void agg_set_n_next_kernel(Control* ctl, i64 n_next) { ctl->n_next = n_next; }
 
-// ---------------------------------------------------------------------------
-// Host side: per-level layout decision (§6.3) and launches
-// ---------------------------------------------------------------------------
-
-// Bottom offset after pushing arrays of the given byte sizes (each aligned
-// like LevelArena::push_bottom).
 inline std::size_t agg_bottom_end(std::size_t bottom, std::initializer_list<std::size_t> sizes)
 {
   std::size_t b = bottom;
@@ -668,127 +545,163 @@ inline std::size_t agg_bottom_end(std::size_t bottom, std::initializer_list<std:
   return b;
 }
 
-// Plan of one level after stage 1 (before SL2).
 struct AggregatePlan {
   bool holey = false;    // holey gather into the arena top
   int* h_idx = nullptr;  // holey region (nnz_l entries)
   float* h_w = nullptr;
 };
 
-// The coarse level after stage 2 (rows and metadata in the arena bottom).
 struct CoarseLevel {
-  i64* indptr        = nullptr;  // [n + 1]
-  i64* khat          = nullptr;  // [n]
-  int* indices       = nullptr;  // [nnz]
-  float* weights     = nullptr;
-  i64 n              = 0;
-  i64 nnz            = 0;
-  bool ok            = true;   // false: workspace_too_small (see arena)
-  bool two_pass      = false;  // a second gather wrote the rows
-  bool second_gather = false;  // holey gather, compaction did not fit
+  i64* indptr    = nullptr;  // [n + 1]
+  i64* khat      = nullptr;  // [n]
+  int* indices   = nullptr;  // [nnz]
+  float* weights = nullptr;
+  i64 n          = 0;
+  i64 nnz        = 0;
+  bool ok        = true;  // false: workspace_too_small (see arena)
 };
 
-template <WKind K, int kMode>
+template <WKind K>
 inline void agg_block_smem_optin()
 {
   static thread_local int done_device = -1;
   const int dev                       = device_info().device;
   if (done_device != dev) {
-    RAFT_CUDA_TRY(cudaFuncSetAttribute(agg_gather_block_kernel<K, kMode>,
+    RAFT_CUDA_TRY(cudaFuncSetAttribute(agg_gather_block_kernel<K>,
                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                                        static_cast<int>(kAggBlockSmem)));
     done_device = dev;
   }
 }
 
-// Every gather class (warp, wide warp, block) over device-resident class
-// counts; the grids use host bounds (n fine vertices, windows) on the number
-// of coarse vertices per class.
-template <WKind K, int kMode>
-void launch_gather(const i64* indptr,
-                   const int* indices,
-                   EdgeW<K> w,
-                   const i64* khat,
-                   i64 n,
-                   const int* cmap,
-                   const AggregateBufs& ab,
-                   const GatherClasses& gc,
-                   const i64* out_off,
-                   int* out_idx,
-                   float* out_w,
-                   Control* ctl,
-                   cudaStream_t s)
+// The gather classes over device-resident counts; the block class runs on 1024
+// slots (four blocks per SM) below kAggSmallWindow, else 4096. Rows disjoint.
+constexpr int kAggSmallSlots  = 1024;
+constexpr i64 kAggSmallWindow = kAggSmallSlots - 1;  // nextpow2(win + 1) fits
+
+template <WKind K>
+void gather_calls(KernelCall* c,
+                  bool on,
+                  const i64* indptr,
+                  const int* indices,
+                  EdgeW<K> w,
+                  const i64* khat,
+                  i64 n,
+                  const int* cmap,
+                  const AggregateBufs& ab,
+                  const GatherClasses& gc,
+                  const i64* out_off,
+                  int* out_idx,
+                  float* out_w,
+                  Control* ctl)
 {
-  agg_gather_warp_kernel<K, kMode, kAggWarpSlots, kWarpsPerBlock>
-    <<<grid_rows(n), kBlock, 0, s>>>(indptr,
-                                     indices,
-                                     w,
-                                     khat,
-                                     cmap,
-                                     ab.member_start,
-                                     ab.members,
-                                     ab.window_offset,
-                                     ab.clist,
-                                     kGatherWarp,
-                                     out_off,
-                                     out_idx,
-                                     out_w,
-                                     ab.cdeg,
-                                     ab.khat_next,
-                                     ctl);
-  RAFT_CHECK_CUDA(s);
-  if (gc.wide > gc.warp) {  // windows > gc.warp: at most nnz / gc.warp ones
-    const i64 bound = n / (gc.warp + 1) + 1;
-    agg_gather_warp_kernel<K, kMode, kAggWideSlots, kAggWideWarps>
-      <<<grid_for(bound, kAggWideWarps, kAggWideWarps * kWarp), kAggWideWarps * kWarp, 0, s>>>(
-        indptr,
-        indices,
-        w,
-        khat,
-        cmap,
-        ab.member_start,
-        ab.members,
-        ab.window_offset,
-        ab.clist_wide,
-        kGatherWide,
-        out_off,
-        out_idx,
-        out_w,
-        ab.cdeg,
-        ab.khat_next,
-        ctl);
-    RAFT_CHECK_CUDA(s);
-  }
-  agg_block_smem_optin<K, kMode>();
-  const i64 sms = device_info().sm_count;
-  const i64 g   = n < 4 * sms ? n : 4 * sms;
-  agg_gather_block_kernel<K, kMode>
-    <<<static_cast<unsigned>(g > 0 ? g : 1), kBlock, kAggBlockSmem, s>>>(indptr,
-                                                                         indices,
-                                                                         w,
-                                                                         khat,
-                                                                         cmap,
-                                                                         ab.member_start,
-                                                                         ab.members,
-                                                                         ab.window_offset,
-                                                                         ab.clist,
-                                                                         n,
-                                                                         gc,
-                                                                         out_off,
-                                                                         out_idx,
-                                                                         out_w,
-                                                                         ab.cdeg,
-                                                                         ab.khat_next,
-                                                                         ctl);
-  RAFT_CHECK_CUDA(s);
+  c[0].set(
+    on,
+    agg_gather_warp_kernel<K, kAggWarpSlots, kWarpsPerBlock>,
+    dim3(grid_occ(agg_gather_warp_kernel<K, kAggWarpSlots, kWarpsPerBlock>, n, kWarpsPerBlock)),
+    dim3(kBlock),
+    0,
+    indptr,
+    indices,
+    w,
+    khat,
+    cmap,
+    ab.member_start,
+    ab.members,
+    ab.window_offset,
+    ab.clist,
+    static_cast<int>(kGatherWarp),
+    out_off,
+    out_idx,
+    out_w,
+    ab.cdeg,
+    ab.khat_next,
+    ctl);
+  // windows > gc.warp are known on the device only: all resident warps run
+  c[1].set(on && gc.wide > gc.warp,
+           agg_gather_warp_kernel<K, kAggWideSlots, kAggWideWarps>,
+           dim3(grid_occ(agg_gather_warp_kernel<K, kAggWideSlots, kAggWideWarps>,
+                         n,
+                         kAggWideWarps,
+                         kAggWideWarps * kWarp)),
+           dim3(kAggWideWarps * kWarp),
+           0,
+           indptr,
+           indices,
+           w,
+           khat,
+           cmap,
+           ab.member_start,
+           ab.members,
+           ab.window_offset,
+           ab.clist_wide,
+           static_cast<int>(kGatherWide),
+           out_off,
+           out_idx,
+           out_w,
+           ab.cdeg,
+           ab.khat_next,
+           ctl);
+  agg_block_smem_optin<K>();
+  const i64 small_hi           = std::min<i64>(kAggSmallWindow, static_cast<i64>(gc.block));
+  const std::size_t small_smem = kAggSmallSlots * (sizeof(u64) + sizeof(int));
+  const i64 gs                 = grid_occ(agg_gather_block_kernel<K>, n, 1, kBlock, small_smem);
+  const i64 gb                 = grid_occ(agg_gather_block_kernel<K>, n, 1, kBlock, kAggBlockSmem);
+  c[2].set(on,
+           agg_gather_block_kernel<K>,
+           dim3(static_cast<unsigned>(gs)),
+           dim3(kBlock),
+           static_cast<unsigned>(kAggSmallSlots * (sizeof(u64) + sizeof(int))),
+           indptr,
+           indices,
+           w,
+           khat,
+           cmap,
+           ab.member_start,
+           ab.members,
+           ab.window_offset,
+           ab.clist,
+           n,
+           gc,
+           out_off,
+           out_idx,
+           out_w,
+           ab.cdeg,
+           ab.khat_next,
+           ctl,
+           kAggSmallSlots,
+           i64{0},
+           small_hi);
+  c[3].set(on,
+           agg_gather_block_kernel<K>,
+           dim3(static_cast<unsigned>(gb)),
+           dim3(kBlock),
+           static_cast<unsigned>(kAggBlockSmem),
+           indptr,
+           indices,
+           w,
+           khat,
+           cmap,
+           ab.member_start,
+           ab.members,
+           ab.window_offset,
+           ab.clist,
+           n,
+           gc,
+           out_off,
+           out_idx,
+           out_w,
+           ab.cdeg,
+           ab.khat_next,
+           ctl,
+           kAggBlockSlots,
+           small_hi + 1,
+           i64{LLONG_MAX});
 }
 
-// Stage 1 (A1-A4a), before SL2: level l (n vertices, nnz stored entries,
-// cmap with n_{l+1} = ctl->n_next on the device) is gathered in holey mode
-// if the holey region (8 nnz bytes, arena top) and the level metadata at its
-// upper bound (n_{l+1} <= n) fit, else in count mode (two-pass level). The
-// caller then reads the Control block (SL2: n_next, nnz_next, coarse classes,
-// max degree) and calls aggregate_finish.
+// Stage 1 (A1-A4a): level l is gathered into the arena top if it fits, else
+// the gathers are disabled and the overflow recorded. One call list after
+// `pre` (R9); the caller reads n_next, nnz_next and the classes at SL2.
 template <WKind K>
 AggregatePlan aggregate_begin(const i64* indptr,
                               const int* indices,
@@ -803,94 +716,108 @@ AggregatePlan aggregate_begin(const i64* indptr,
                               void* cub,
                               std::size_t cub_bytes,
                               Control* ctl,
-                              cudaStream_t s)
+                              cudaStream_t s,
+                              std::vector<KernelCall> pre = {})
 {
   AggregatePlan plan;
   const std::size_t nu   = static_cast<std::size_t>(n);
   const std::size_t meta = align_up(8 * (nu + 1)) + align_up(8 * nu);
   const std::size_t holey =
     align_up(4 * static_cast<std::size_t>(nnz)) + align_up(4 * static_cast<std::size_t>(nnz));
-  plan.holey = !opt.low_memory && !opt.force_two_pass && arena.fits(meta, holey);
+  plan.holey = arena.fits(meta, holey);
   if (plan.holey) {
     plan.h_idx = arena.push_top<int>(static_cast<std::size_t>(nnz));
     plan.h_w   = arena.push_top<float>(static_cast<std::size_t>(nnz));
+  } else {
+    arena.note_overflow(align_up(arena.bottom) + meta + align_up(arena.top) + holey);
   }
-  const unsigned gi = grid_items(n + 1);
-  agg_init_kernel<<<gi, kBlock, 0, s>>>(n, ab.member_count, ab.window, ab.cdeg, ctl);
-  RAFT_CHECK_CUDA(s);
-  if (n > 0) {
-    agg_count_kernel<<<grid_items(n), kBlock, 0, s>>>(
-      indptr, cmap, n, ab.member_count, ab.window, ctl);
-    RAFT_CHECK_CUDA(s);
-  }
-  std::size_t tb = cub_bytes;
-  RAFT_CUDA_TRY(scan_offsets64<int>(cub, tb, ab.member_count, ab.member_start, n + 1, s));
-  tb = cub_bytes;
-  RAFT_CUDA_TRY(scan_offsets64<i64>(cub, tb, ab.window, ab.window_offset, n + 1, s));
-  if (n > 0) {
-    agg_scatter_kernel<<<grid_items(n), kBlock, 0, s>>>(cmap,
-                                                        n,
-                                                        ab.member_start,
-                                                        ab.member_count,
-                                                        ab.members,
-                                                        ab.window_offset,
-                                                        opt.gather,
-                                                        ab.clist,
-                                                        ab.clist_wide,
-                                                        ctl);
-    RAFT_CHECK_CUDA(s);
-    if (plan.holey) {
-      launch_gather<K, kAggHoley>(indptr,
-                                  indices,
-                                  w,
-                                  khat,
-                                  n,
-                                  cmap,
-                                  ab,
-                                  opt.gather,
-                                  ab.window_offset,
-                                  plan.h_idx,
-                                  plan.h_w,
-                                  ctl,
-                                  s);
-    } else {
-      launch_gather<K, kAggCount>(
-        indptr, indices, w, khat, n, cmap, ab, opt.gather, nullptr, nullptr, nullptr, ctl, s);
-    }
-  }
-  tb = cub_bytes;
-  RAFT_CUDA_TRY(scan_offsets64<i64>(cub, tb, ab.cdeg, ab.indptr_next, n + 1, s));
-  agg_stats_kernel<<<grid_items(n), kBlock, 0, s>>>(ab.cdeg, ab.indptr_next, opt.move, ctl);
-  RAFT_CHECK_CUDA(s);
+  std::vector<KernelCall> c = std::move(pre);
+  std::size_t k             = c.size();
+  c.resize(k + 18);
+  const bool on = n > 0;
+  c[k++].set(true,
+             agg_init_kernel,
+             dim3(grid_items(n + 1)),
+             dim3(kBlock),
+             0,
+             n,
+             ab.member_count,
+             ab.window,
+             ab.cdeg,
+             ctl);
+  c[k++].set(on,
+             agg_count_kernel,
+             dim3(grid_items(n)),
+             dim3(kBlock),
+             0,
+             indptr,
+             cmap,
+             n,
+             ab.member_count,
+             ab.window,
+             ctl);
+  scan_calls(&c[k], ScanArray<int, i64>{ab.member_count}, ab.member_start, n + 1, cub, cub_bytes);
+  k += 3;
+  scan_calls(&c[k], ScanArray<i64, i64>{ab.window}, ab.window_offset, n + 1, cub, cub_bytes);
+  k += 3;
+  c[k++].set(on,
+             agg_scatter_kernel,
+             dim3(grid_items(n)),
+             dim3(kBlock),
+             0,
+             cmap,
+             n,
+             ab.member_start,
+             ab.member_count,
+             ab.members,
+             ab.window_offset,
+             opt.gather,
+             ab.clist,
+             ab.clist_wide,
+             ctl);
+  gather_calls<K>(&c[k],
+                  on && plan.holey,
+                  indptr,
+                  indices,
+                  w,
+                  khat,
+                  n,
+                  cmap,
+                  ab,
+                  opt.gather,
+                  ab.window_offset,
+                  plan.h_idx,
+                  plan.h_w,
+                  ctl);
+  k += 4;
+  scan_calls(&c[k], ScanArray<i64, i64>{ab.cdeg}, ab.indptr_next, n + 1, cub, cub_bytes);
+  k += 3;
+  c[k++].set(true,
+             agg_stats_kernel,
+             dim3(grid_items(n)),
+             dim3(kBlock),
+             0,
+             ab.cdeg,
+             ab.indptr_next,
+             opt.move,
+             ctl);
+  c.resize(k);
+  launch_chain(c, opt.stage1, s);
   return plan;
 }
 
-// Stage 2, after SL2 (n_next, nnz_next known on the host): reserves the
-// exact metadata (indptr_{l+1}, k_hat_{l+1}) and rows (int32 indices, fp32
-// weights) in the arena bottom. A holey level compacts its rows below the
-// holey region when they fit there (one pass); otherwise the holey region is
-// released and a second gather writes the rows directly (the level becomes
-// two-pass). Only if even that does not fit is the result !ok, with
-// arena.required set (workspace_too_small). Then P_{l+1} (if P is given) and
-// the metadata. Layout never reaches a decision: every path gives the same
-// rows as multisets and identical metadata.
-template <WKind K>
-CoarseLevel aggregate_finish(const i64* indptr,
-                             const int* indices,
-                             EdgeW<K> w,
-                             const i64* khat,
-                             i64 n,
-                             const int* cmap,
-                             const AggregatePlan& plan,
-                             i64 n_next,
-                             i64 nnz_next,
-                             const AggregateOptions& opt,
-                             const AggregateBufs& ab,
-                             LevelArena& arena,
-                             const int* P,
-                             int* P_next,
-                             Control* ctl,
-                             cudaStream_t s)
+// Stage 2, after SL2: exact metadata and compacted rows (arena bottom), then
+// P_{l+1} if P is given; !ok (arena.required set) if the level does not fit.
+inline CoarseLevel aggregate_finish(i64 n,
+                                    const int* cmap,
+                                    const AggregatePlan& plan,
+                                    i64 n_next,
+                                    i64 nnz_next,
+                                    const AggregateBufs& ab,
+                                    LevelArena& arena,
+                                    const int* P,
+                                    int* P_next,
+                                    cudaStream_t s)
 {
   CoarseLevel lv;
   lv.n                  = n_next;
@@ -898,53 +825,27 @@ CoarseLevel aggregate_finish(const i64* indptr,
   const std::size_t nn  = static_cast<std::size_t>(n_next);
   const std::size_t ne  = static_cast<std::size_t>(nnz_next);
   const std::size_t end = agg_bottom_end(arena.bottom, {8 * (nn + 1), 8 * nn, 4 * ne, 4 * ne});
-  auto push             = [&] {
-    lv.indptr  = arena.push_bottom<i64>(nn + 1);
-    lv.khat    = arena.push_bottom<i64>(nn);
-    lv.indices = arena.push_bottom<int>(ne);
-    lv.weights = arena.push_bottom<float>(ne);
-  };
-  if (plan.holey && !opt.force_second_gather && end + arena.top <= arena.cap) {
-    push();
-    if (n_next > 0) {
-      agg_compact_kernel<<<grid_rows(n_next), kBlock, 0, s>>>(ab.window_offset,
-                                                              ab.cdeg,
-                                                              ab.indptr_next,
-                                                              n_next,
-                                                              plan.h_idx,
-                                                              plan.h_w,
-                                                              lv.indices,
-                                                              lv.weights);
-      RAFT_CHECK_CUDA(s);
-    }
-    arena.release_top();
-  } else {
-    if (plan.holey) {
-      arena.release_top();
-      lv.second_gather = true;
-    }
-    lv.two_pass = true;
-    if (end > arena.cap) {
-      arena.note_overflow(end);
-      lv.ok = false;
-      return lv;
-    }
-    push();
-    if (n > 0)
-      launch_gather<K, kAggWrite>(indptr,
-                                  indices,
-                                  w,
-                                  khat,
-                                  n,
-                                  cmap,
-                                  ab,
-                                  opt.gather,
-                                  ab.indptr_next,
-                                  lv.indices,
-                                  lv.weights,
-                                  ctl,
-                                  s);
+  if (!plan.holey || end + arena.top > arena.cap) {
+    arena.note_overflow(end + arena.top);
+    lv.ok = false;
+    return lv;
   }
+  lv.indptr  = arena.push_bottom<i64>(nn + 1);
+  lv.khat    = arena.push_bottom<i64>(nn);
+  lv.indices = arena.push_bottom<int>(ne);
+  lv.weights = arena.push_bottom<float>(ne);
+  if (n_next > 0) {
+    agg_compact_kernel<<<grid_rows(n_next), kBlock, 0, s>>>(ab.window_offset,
+                                                            ab.cdeg,
+                                                            ab.indptr_next,
+                                                            n_next,
+                                                            plan.h_idx,
+                                                            plan.h_w,
+                                                            lv.indices,
+                                                            lv.weights);
+    RAFT_CHECK_CUDA(s);
+  }
+  arena.release_top();
   agg_finish_kernel<<<grid_items((n > n_next ? n : n_next) + 1), kBlock, 0, s>>>(
     n, n_next, cmap, P, P_next, ab.indptr_next, ab.khat_next, lv.indptr, lv.khat);
   RAFT_CHECK_CUDA(s);
