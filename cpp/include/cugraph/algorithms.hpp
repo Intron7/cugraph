@@ -700,9 +700,9 @@ struct leiden_result_t {
  *    modularity is summed in a fixed order. Identical inputs, parameters and seed therefore give
  *    the bitwise identical clustering and modularity, independently of thread scheduling and
  *    launch configuration, vertex_t / edge_t, weight_t (as long as the weight values are equal)
- *    and, for multi-GPU, the number of GPUs; by construction this also holds across GPU
- *    architectures. Vertex ids enter the hashes, so a different vertex numbering (e.g.
- *    renumbering) gives a different, equally valid clustering.
+ *    and, for multi-GPU, the number of GPUs. The arithmetic is designed to give the same result
+ *    across GPU architectures as well. Vertex ids enter the hashes, so a different vertex
+ *    numbering (e.g. renumbering) gives a different, equally valid clustering.
  *
  * Edge semantics: the graph must be symmetric (every undirected edge stored in both directions
  * with the same weight; the data is checked, not the is_symmetric() flag). Weights must be finite

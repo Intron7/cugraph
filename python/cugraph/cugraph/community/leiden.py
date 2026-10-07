@@ -39,9 +39,10 @@ def leiden(
     * the returned modularity is the exact modularity of the returned
       partition (see Returns);
     * the result is deterministic: with a fixed `random_state`, the same
-      graph gives the bitwise identical partition and modularity on any GPU,
-      for 32- and 64-bit vertex ids and for float and double weights (with
-      equal values).
+      graph gives the bitwise identical partition and modularity on every
+      call, for 32- and 64-bit vertex ids and for float and double weights
+      (with equal values). The arithmetic is designed to give the same
+      result on other GPU architectures as well.
 
     Parameters
     ----------

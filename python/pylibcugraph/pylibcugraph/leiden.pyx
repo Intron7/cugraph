@@ -82,8 +82,10 @@ def leiden(ResourceHandle resource_handle,
       returned clustering (self-loops excluded);
     * the result is deterministic: the same graph, parameters and
       random_state give the bitwise identical clustering and modularity on
-      any GPU, for 32- and 64-bit vertex ids, for float and double weights
-      (with equal values) and, for an MGGraph, for any number of GPUs.
+      every call, for 32- and 64-bit vertex ids, for float and double weights
+      (with equal values) and, for an MGGraph, for any number of GPUs. The
+      arithmetic is designed to give the same result on other GPU
+      architectures as well.
 
     Parameters
     ----------
